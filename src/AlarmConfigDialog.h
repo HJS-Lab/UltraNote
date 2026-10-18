@@ -26,6 +26,10 @@ private:
     void CreateControls();
     void LoadFromNote();
     void WriteToNote();
+    // Read the schedule/notification fields from the controls into `a` (shared
+    // by WriteToNote and UpdatePreview so the preview can never disagree with
+    // what gets saved). Runtime state (firedCount etc.) is left untouched.
+    void ReadControls(AlarmConfig& a) const;
     void UpdateControlStates();
     void UpdatePreview();
     void BrowseSoundFile();
@@ -38,6 +42,7 @@ private:
 
     HWND m_hwnd = nullptr;
     HFONT m_hFont = nullptr;
+    UINT m_dpi = 96;   // owner's monitor DPI; all k* layout constants are 96-dpi
 
     // Control handles (grouped by section)
     HWND m_hStartDate = nullptr;
@@ -78,9 +83,6 @@ private:
     HWND m_hBtnRemove     = nullptr;
 
     HWND m_hTooltip       = nullptr;
-
-    // Label controls (kept for destroy)
-    std::vector<HWND> m_labels;
 
     static bool s_classRegistered;
 };

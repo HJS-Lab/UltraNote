@@ -17,11 +17,20 @@ public:
     //          (e.g. Weekly with empty weekdayMask).
     // Respects:
     //   - paused: returns nullopt
-    //   - snoozeUntil > nowSec: returns the snooze time
+    //   - snoozeUntil > 0: returns the snooze time (even if already past)
     //   - endKind AfterN: nullopt if firedCount >= endCount
     //   - endKind OnDate: nullopt if computed time > endDate
     static std::optional<SYSTEMTIME> ComputeNextFireTime(const AlarmConfig& alarm,
                                                          const SYSTEMTIME& now);
+
+    // Catch-up for RECURRING alarms: the latest occurrence that fell due after
+    // the last fire (alarm.lastFiredSec) and at or before `now`, i.e. one that
+    // was missed while the app was not running or the PC was asleep. nullopt
+    // when nothing was missed, the alarm is paused/snoozed/expired, or it has
+    // never fired/been anchored yet (lastFiredSec == 0). Only the most recent
+    // missed occurrence is returned, so a week of missed dailies fires once.
+    static std::optional<SYSTEMTIME> ComputeMissedOccurrence(const AlarmConfig& alarm,
+                                                             const SYSTEMTIME& now);
 
     // Compact human-readable description of the repetition pattern
     // (used in Notizlist "Intervall" column). Uses Ls() for localization.

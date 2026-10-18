@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include "Note.h"
+#include "Utils.h"   // DpiScale / WindowDpi for Px()
 
 class FindInNoteDialog;
 class AlarmConfigDialog;
@@ -103,8 +104,19 @@ private:
     // Resize the EDIT control to fill the note interior minus the attachment bar.
     void LayoutEditCtrl();
 
-    // Sync NoteData position from current window rect
-    void SyncDataFromWindow();
+    // Sync NoteData position/size from the current window rect.
+    // Returns true if anything changed (callers only notify/dirty then).
+    bool SyncDataFromWindow();
+
+    // DPI-scaled layout metrics: the constants at the bottom are 96-dpi
+    // reference values, Px() maps them to the note's monitor DPI.
+    int   Px(int v96) const { return DpiScale(v96, WindowDpi(m_hwnd)); }
+    HFONT GetAttachFont();   // message font for the attachment bar at the note's DPI
+
+    // Display font for the configured layout, cached across paints (was created
+    // and destroyed on every WM_PAINT). Rebuilt when the layout params change.
+    HFONT GetTextFont(HDC hdc);
+    HFONT GetUrlFont(HDC hdc);   // underlined variant for links (lazy)
 
     // Notify application of changes
     void NotifyChanged();
@@ -116,6 +128,14 @@ private:
     HINSTANCE  m_hInst         = nullptr;
     HBRUSH     m_hEditBrush    = nullptr;
     COLORREF   m_editBrushColor = CLR_INVALID;  // color m_hEditBrush was made for
+    HFONT      m_hTextFont     = nullptr;       // cached display font (see GetTextFont)
+    HFONT      m_hUrlFont      = nullptr;       // cached underlined variant
+    HFONT      m_hAttachFont   = nullptr;       // attachment-bar font (see GetAttachFont)
+    UINT       m_attachFontDpi = 0;             // DPI m_hAttachFont was made for
+    std::wstring m_fontKeyFace;                 // layout params m_hTextFont was made for
+    int        m_fontKeySize   = 0;
+    bool       m_fontKeyBold   = false;
+    bool       m_fontKeyItalic = false;
 
     bool       m_selected      = false;
     bool       m_inEditMode    = false;
@@ -142,6 +162,11 @@ private:
     };
     std::vector<UrlRect> m_urlRects;
     int m_pendingUrlClick = -1;
+    int m_pendingAttachClick = -1;   // attachment row pressed in WM_LBUTTONDOWN
+    // Set when a WM_SYSKEYDOWN was consumed as a shortcut: the WM_SYSCHAR that
+    // TranslateMessage derives from it is then swallowed (else DefWindowProc
+    // beeps / hunts for a menu mnemonic).
+    bool m_swallowNextSysChar = false;
 
     // Attachment icon cache
     std::vector<HICON> m_attachIcons;

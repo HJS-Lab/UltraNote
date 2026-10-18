@@ -3,6 +3,7 @@
 #include "AlarmScheduler.h"
 #include "Localization.h"
 #include "Resource.h"
+#include "Utils.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <algorithm>
@@ -38,6 +39,36 @@ static constexpr int kNumEditYOff  = 1;
 static constexpr int kEditYOff     = kNumEditYOff - 1;
 // Gap between numeric edit (right edge) and following post-label.
 static constexpr int kPostLabelGap = 4;
+
+// UI bounds shared by the spinners and the clamps in ReadControls. (Storage
+// accepts a wider range for hand-edited files; the dialog never produces it.)
+static constexpr int kMaxEndCount      = 999;
+static constexpr int kMaxSnoozeMinutes = 1440;
+
+// True when two configs describe the same schedule (everything except the
+// notification settings and the runtime state). Used to decide whether a save
+// must reset firedCount/snooze/lastFired.
+static bool SameSchedule(const AlarmConfig& x, const AlarmConfig& y) {
+    if (AlarmScheduler::CompareSysTime(x.startTime, y.startTime) != 0 ||
+        x.kind != y.kind || x.intervalDays != y.intervalDays ||
+        x.weekdayMask != y.weekdayMask || x.monthDay != y.monthDay ||
+        x.nthWeek != y.nthWeek || x.nthWeekday != y.nthWeekday ||
+        x.quarterDay != y.quarterDay || x.endKind != y.endKind)
+        return false;
+    // End details only matter for the active end kind. Compare the DATE part
+    // of endDate only and the UI-clamped count: files from v1.8.x stored a
+    // time-of-day in endDate (and may hold counts above kMaxEndCount), which
+    // otherwise made the first save look like a schedule change and reset the
+    // runtime state (fired Once alarms popped again).
+    if (x.endKind == AlarmEndKind::AfterN &&
+        (std::clamp)(x.endCount, 1, kMaxEndCount) != (std::clamp)(y.endCount, 1, kMaxEndCount))
+        return false;
+    if (x.endKind == AlarmEndKind::OnDate &&
+        (x.endDate.wYear != y.endDate.wYear || x.endDate.wMonth != y.endDate.wMonth ||
+         x.endDate.wDay != y.endDate.wDay))
+        return false;
+    return true;
+}
 
 // Display order: Mon..Sun (European). Maps to weekdayMask bit positions:
 // bit 0 = Sunday, bit 1 = Monday, ..., bit 6 = Saturday (SYSTEMTIME::wDayOfWeek).
@@ -75,7 +106,10 @@ bool AlarmConfigDialog::EnsureClassRegistered(HINSTANCE hInst) {
 bool AlarmConfigDialog::Create() {
     if (!EnsureClassRegistered(m_hInst)) return false;
 
-    RECT r = { 0, 0, kClientW, kClientH };
+    // Lay out for the owner's monitor DPI (the k* constants are 96-dpi values;
+    // CreateControls scales every coordinate through the Make* helpers).
+    m_dpi = WindowDpi(m_hOwner);
+    RECT r = { 0, 0, DpiScale(kClientW, m_dpi), DpiScale(kClientH, m_dpi) };
     DWORD style   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = WS_EX_TOOLWINDOW;
     AdjustWindowRectEx(&r, style, FALSE, exStyle);
@@ -208,6 +242,11 @@ LRESULT AlarmConfigDialog::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
 
+        case DM_GETDEFID:
+            // Not a real dialog: answer IsDialogMessageW so Enter triggers the
+            // default "Save" button instead of sending an unhandled IDOK.
+            return MAKELRESULT(IDC_ALARM_OK, DC_HASDEFID);
+
         case WM_CLOSE:
             DestroyWindow(m_hwnd);
             return 0;
@@ -219,7 +258,10 @@ LRESULT AlarmConfigDialog::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
                 // owner stays in whatever z-order the OS picks, which can be
                 // behind other apps that grabbed focus while the dialog lived.
                 EnableWindow(m_hOwner, TRUE);
-                SetForegroundWindow(m_hOwner);
+                // ... but only raise a VISIBLE owner: a note hidden while its
+                // dialog was open would otherwise become the invisible focus
+                // target (Del/F2 acting on a note the user cannot see).
+                if (IsWindowVisible(m_hOwner)) SetForegroundWindow(m_hOwner);
             }
             return 0;
 
@@ -233,12 +275,18 @@ LRESULT AlarmConfigDialog::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// Layout DPI for the Make* helpers below: CreateControls sets it from m_dpi
+// before building; every x/y/w/h they receive is a 96-dpi value. (A dialog is
+// built synchronously on the UI thread, so a file-static is safe.)
+static UINT s_layoutDpi = 96;
+static int S(int px) { return DpiScale(px, s_layoutDpi); }
+
 static HWND MakeStatic(HWND parent, HINSTANCE hInst, HFONT font,
                        const wchar_t* text, int x, int y, int w, int h,
                        DWORD extraStyle = 0) {
     HWND h_ = CreateWindowExW(0, L"STATIC", text,
                               WS_CHILD | WS_VISIBLE | SS_LEFT | extraStyle,
-                              x, y, w, h, parent, nullptr, hInst, nullptr);
+                              S(x), S(y), S(w), S(h), parent, nullptr, hInst, nullptr);
     SendMessageW(h_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     return h_;
 }
@@ -249,7 +297,7 @@ static HWND MakeRadio(HWND parent, HINSTANCE hInst, HFONT font, int id,
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON;
     if (groupStart) style |= WS_GROUP;
     HWND h_ = CreateWindowExW(0, L"BUTTON", text, style,
-                              x, y, w, h, parent,
+                              S(x), S(y), S(w), S(h), parent,
                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                               hInst, nullptr);
     SendMessageW(h_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -260,7 +308,7 @@ static HWND MakeCheck(HWND parent, HINSTANCE hInst, HFONT font, int id,
                       const wchar_t* text, int x, int y, int w, int h) {
     HWND h_ = CreateWindowExW(0, L"BUTTON", text,
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                              x, y, w, h, parent,
+                              S(x), S(y), S(w), S(h), parent,
                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                               hInst, nullptr);
     SendMessageW(h_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -273,7 +321,7 @@ static HWND MakeEdit(HWND parent, HINSTANCE hInst, HFONT font, int id,
     if (numeric) style |= ES_NUMBER | ES_CENTER;
     else         style |= ES_LEFT;
     HWND h_ = CreateWindowExW(0, L"EDIT", L"", style,
-                              x, y, w, h, parent,
+                              S(x), S(y), S(w), S(h), parent,
                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                               hInst, nullptr);
     SendMessageW(h_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -300,7 +348,7 @@ static HWND MakeNumEditWithSpin(HWND parent, HINSTANCE hInst, HFONT font,
 static void AddSeparator(HWND parent, HINSTANCE hInst, int x, int y, int w) {
     CreateWindowExW(0, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-        x, y, w, 1, parent, nullptr, hInst, nullptr);
+        S(x), S(y), S(w), 1, parent, nullptr, hInst, nullptr);
 }
 
 static HWND MakeButton(HWND parent, HINSTANCE hInst, HFONT font, int id,
@@ -309,7 +357,7 @@ static HWND MakeButton(HWND parent, HINSTANCE hInst, HFONT font, int id,
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                   (defaultBtn ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON);
     HWND h_ = CreateWindowExW(0, L"BUTTON", text, style,
-                              x, y, w, h, parent,
+                              S(x), S(y), S(w), S(h), parent,
                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                               hInst, nullptr);
     SendMessageW(h_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -317,8 +365,9 @@ static HWND MakeButton(HWND parent, HINSTANCE hInst, HFONT font, int id,
 }
 
 void AlarmConfigDialog::CreateControls() {
-    NONCLIENTMETRICS ncm = { sizeof(ncm) };
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    s_layoutDpi = m_dpi;   // Make* helpers scale through this (see above)
+    NONCLIENTMETRICSW ncm;
+    GetNonClientMetricsForDpi(ncm, m_dpi);
     m_hFont = CreateFontIndirectW(&ncm.lfMessageFont);
 
     const int contentW = kClientW - 2 * kMargin;
@@ -327,20 +376,20 @@ void AlarmConfigDialog::CreateControls() {
     int y = kMargin;
 
     // ─── Section: Start time ───
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.start").c_str(),
-                                  kMargin, y, contentW, kRowH));
+                                  kMargin, y, contentW, kRowH);
     y += kRowH;
     m_hStartDate = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | DTS_SHORTDATEFORMAT,
-        kMargin, y, 130, kRowH, m_hwnd,
+        S(kMargin), S(y), S(130), S(kRowH), m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_START_DATE)),
         m_hInst, nullptr);
     SendMessageW(m_hStartDate, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFont), TRUE);
 
     m_hStartTime = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | DTS_TIMEFORMAT,
-        kMargin + 140, y, 90, kRowH, m_hwnd,
+        S(kMargin + 140), S(y), S(90), S(kRowH), m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_START_TIME)),
         m_hInst, nullptr);
     SendMessageW(m_hStartTime, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFont), TRUE);
@@ -348,10 +397,10 @@ void AlarmConfigDialog::CreateControls() {
 
     // ─── Section: Repetition ───
     AddSeparator(m_hwnd, m_hInst, kMargin, y - kSectionGap / 2, contentW);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.repeat").c_str(),
                                   kMargin, y, contentW, kRowH,
-                                  SS_CENTERIMAGE));
+                                  SS_CENTERIMAGE);
     y += kRowH;
 
     // Kind radio group 1 starts here (WS_GROUP)
@@ -373,10 +422,10 @@ void AlarmConfigDialog::CreateControls() {
                                         IDC_ALARM_EVERY_N_EDIT, IDC_ALARM_EVERY_N_SPIN,
                                         kEditColLvl2, y + kEditYOff,
                                         kNumEditW, kNumEditH, 1, 365);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.every_n_post").c_str(),
                                   kEditColLvl2 + kNumEditW + kPostLabelGap,
-                                  y + kNumEditYOff, 120, kNumEditH));
+                                  y + kNumEditYOff, 120, kNumEditH);
     y += kRowH;
 
     m_hRbWeekly = MakeRadio(m_hwnd, m_hInst, m_hFont, IDC_ALARM_KIND_WEEKLY,
@@ -409,10 +458,10 @@ void AlarmConfigDialog::CreateControls() {
                                             IDC_ALARM_MONTHLY_DAY_SPIN,
                                             kEditColLvl2, y + kEditYOff,
                                             kNumEditW, kNumEditH, 1, 31);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.monthly_day_post").c_str(),
                                   kEditColLvl2 + kNumEditW + kPostLabelGap,
-                                  y + kNumEditYOff, 200, kNumEditH));
+                                  y + kNumEditYOff, 200, kNumEditH);
     y += kRowH;
 
     // Sub-option: "jeden [n] [Weekday]" — edit + combobox on Level-2 column.
@@ -427,8 +476,8 @@ void AlarmConfigDialog::CreateControls() {
                                             kNumEditW, kNumEditH, 1, 5);
     m_hComboMonthlyWd = CreateWindowExW(0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-        kEditColLvl2 + kNumEditW + kPostLabelGap, y + kNumEditYOff,
-        110, kNumEditH * 8,
+        S(kEditColLvl2 + kNumEditW + kPostLabelGap), S(y + kNumEditYOff),
+        S(110), S(kNumEditH * 8),
         m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_MONTHLY_NTH_COMBO)),
         m_hInst, nullptr);
@@ -452,10 +501,10 @@ void AlarmConfigDialog::CreateControls() {
                                             IDC_ALARM_QUARTER_DAY_SPIN,
                                             kEditColLvl1 + kQuarterlyShift, y + kEditYOff,
                                             kNumEditW, kNumEditH, 1, 90);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.quarterly_post").c_str(),
                                   kEditColLvl1 + kQuarterlyShift + kNumEditW + kPostLabelGap,
-                                  y + kNumEditYOff, 220, kNumEditH));
+                                  y + kNumEditYOff, 220, kNumEditH);
     y += kRowH;
 
     m_hRbYearly = MakeRadio(m_hwnd, m_hInst, m_hFont, IDC_ALARM_KIND_YEARLY,
@@ -465,10 +514,10 @@ void AlarmConfigDialog::CreateControls() {
 
     // ─── Section: End ───
     AddSeparator(m_hwnd, m_hInst, kMargin, y - kSectionGap / 2, contentW);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.end").c_str(),
                                   kMargin, y, contentW, kRowH,
-                                  SS_CENTERIMAGE));
+                                  SS_CENTERIMAGE);
     y += kRowH;
 
     m_hRbEndNever = MakeRadio(m_hwnd, m_hInst, m_hFont, IDC_ALARM_END_NEVER,
@@ -484,11 +533,11 @@ void AlarmConfigDialog::CreateControls() {
                                           IDC_ALARM_END_COUNT_EDIT,
                                           IDC_ALARM_END_COUNT_SPIN,
                                           kEditColLvl2, y + kEditYOff,
-                                          kNumEditW, kNumEditH, 1, 999);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+                                          kNumEditW, kNumEditH, 1, kMaxEndCount);
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.end_after_post").c_str(),
                                   kEditColLvl2 + kNumEditW + kPostLabelGap,
-                                  y + kNumEditYOff, 180, kNumEditH));
+                                  y + kNumEditYOff, 180, kNumEditH);
     y += kRowH;
 
     // "Am [Datum]" — date picker on Level-2 column (aligned with Nach-spinner)
@@ -497,7 +546,7 @@ void AlarmConfigDialog::CreateControls() {
                                lvl1X, y, kEditColLvl2 - lvl1X - 4, kRowH, false);
     m_hEndDate = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | DTS_SHORTDATEFORMAT,
-        kEditColLvl2, y, 130, kRowH, m_hwnd,
+        S(kEditColLvl2), S(y), S(130), S(kRowH), m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_END_DATE)),
         m_hInst, nullptr);
     SendMessageW(m_hEndDate, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFont), TRUE);
@@ -505,9 +554,9 @@ void AlarmConfigDialog::CreateControls() {
 
     // ─── Section: Notification ───
     AddSeparator(m_hwnd, m_hInst, kMargin, y - kSectionGap / 2, contentW);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.notify").c_str(),
-                                  kMargin, y, contentW, kRowH));
+                                  kMargin, y, contentW, kRowH);
     y += kRowH;
 
     m_hChkPopup = MakeCheck(m_hwnd, m_hInst, m_hFont, IDC_ALARM_POPUP_CHK,
@@ -521,10 +570,10 @@ void AlarmConfigDialog::CreateControls() {
     // "Sound-Datei: [.................................] [...]"
     // Label needs 5 px more room; edit shifts 5 px right and shrinks by 5,
     // keeping the browse button's left edge flush to the edit's right edge.
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.sound_file").c_str(),
                                   lvl1X, y, 78, kRowH,
-                                  SS_CENTERIMAGE));
+                                  SS_CENTERIMAGE);
     {
         int editX   = lvl1X + 78;
         int browseW = 30;
@@ -538,18 +587,18 @@ void AlarmConfigDialog::CreateControls() {
     y += kRowH + kRowGap;
 
     // "Schlummern: [n] Minuten    [ ] Pausiert" — edit on Level-1 column
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.snooze_pre").c_str(),
                                   lvl1X, y + kNumEditYOff,
-                                  kEditColLvl1 - lvl1X - 4, kNumEditH));
+                                  kEditColLvl1 - lvl1X - 4, kNumEditH);
     m_hEditSnooze = MakeNumEditWithSpin(m_hwnd, m_hInst, m_hFont,
                                         IDC_ALARM_SNOOZE_EDIT, IDC_ALARM_SNOOZE_SPIN,
                                         kEditColLvl1, y + kEditYOff,
-                                        kNumEditW, kNumEditH, 1, 1440);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+                                        kNumEditW, kNumEditH, 1, kMaxSnoozeMinutes);
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.snooze_post").c_str(),
                                   kEditColLvl1 + kNumEditW + kPostLabelGap,
-                                  y + kNumEditYOff, 80, kNumEditH));
+                                  y + kNumEditYOff, 80, kNumEditH);
     m_hChkPaused = MakeCheck(m_hwnd, m_hInst, m_hFont, IDC_ALARM_PAUSED_CHK,
                              Ls(L"alarm.cfg.paused").c_str(),
                              kEditColLvl1 + kNumEditW + kPostLabelGap + 90,
@@ -558,10 +607,10 @@ void AlarmConfigDialog::CreateControls() {
 
     // ─── Section: Preview ───
     AddSeparator(m_hwnd, m_hInst, kMargin, y - kSectionGap / 2, contentW);
-    m_labels.push_back(MakeStatic(m_hwnd, m_hInst, m_hFont,
+    MakeStatic(m_hwnd, m_hInst, m_hFont,
                                   Ls(L"alarm.cfg.preview").c_str(),
                                   kMargin, y, 80, kRowH,
-                                  SS_CENTERIMAGE));
+                                  SS_CENTERIMAGE);
     m_hPreview = MakeStatic(m_hwnd, m_hInst, m_hFont, L"",
                             kMargin + 80, y, contentW - 80, kRowH);
     y += kRowH + kSectionGap;
@@ -581,7 +630,7 @@ void AlarmConfigDialog::CreateControls() {
         SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
         ti.uId      = reinterpret_cast<UINT_PTR>(m_hEditEndCount);
         SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
-        SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 320);
+        SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, S(320));
     }
 
     // Buttons
@@ -710,8 +759,30 @@ void AlarmConfigDialog::WriteToNote() {
     NoteData* note = Application::Get().FindNoteData(m_noteId);
     if (!note) return;
 
-    AlarmConfig a = note->alarm.has_value() ? *note->alarm : AlarmConfig{};
+    const bool hadAlarm = note->alarm.has_value();
+    AlarmConfig a = hadAlarm ? *note->alarm : AlarmConfig{};
+    const AlarmConfig before = a;
+    ReadControls(a);
 
+    // Reset the runtime state only when the SCHEDULE changed (or the alarm is
+    // new). Resetting on every save re-popped an already fired Once alarm after
+    // a restart and restarted the AfterN count whenever only e.g. the sound
+    // file was edited. lastFiredSec = 0 re-anchors the missed-occurrence
+    // catch-up at the next check (Application::CheckDueAlarms); a pause/unpause
+    // re-anchors as well so occurrences skipped while paused are not caught up.
+    if (!hadAlarm || !SameSchedule(before, a)) {
+        a.firedCount   = 0;
+        a.snoozeUntil  = 0;
+        a.lastFiredSec = 0;
+    } else if (before.paused != a.paused) {
+        a.lastFiredSec = 0;
+        a.snoozeUntil  = 0;   // a snooze from before the pause must not fire on resume
+    }
+
+    note->alarm = std::move(a);
+}
+
+void AlarmConfigDialog::ReadControls(AlarmConfig& a) const {
     // Start time (combine date + time)
     SYSTEMTIME dt, tm;
     SendMessageW(m_hStartDate, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&dt));
@@ -762,32 +833,35 @@ void AlarmConfigDialog::WriteToNote() {
     GetWindowTextW(m_hEditQuarterDay, buf, 32);
     a.quarterDay = (std::clamp)(_wtoi(buf), 1, 90);
 
-    // End condition
+    // End condition. A Once alarm fires exactly once: the (greyed-out) end
+    // radios must not leak into it - a stale OnDate/AfterN from an earlier
+    // recurring setup made the scheduler drop the single occurrence entirely.
     if (SendMessageW(m_hRbEndNever,   BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::Never;
     else if (SendMessageW(m_hRbEndAfterN,  BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::AfterN;
     else if (SendMessageW(m_hRbEndOnDate,  BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::OnDate;
+    if (a.kind == AlarmKind::Once) a.endKind = AlarmEndKind::Never;
 
     GetWindowTextW(m_hEditEndCount, buf, 32);
-    a.endCount = (std::clamp)(_wtoi(buf), 1, 100000);   // match Storage clamp
+    a.endCount = (std::clamp)(_wtoi(buf), 1, kMaxEndCount);
     SYSTEMTIME endDt;
     SendMessageW(m_hEndDate, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&endDt));
+    // Date only: the picker returns a time-of-day too, which would make every
+    // save look like a schedule change (SameSchedule) and reset the runtime state.
+    endDt.wHour = endDt.wMinute = endDt.wSecond = endDt.wMilliseconds = 0;
     a.endDate = endDt;
 
     // Notification
     a.popup = SendMessageW(m_hChkPopup, BM_GETCHECK, 0, 0) == BST_CHECKED;
     a.sound = SendMessageW(m_hChkSound, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    wchar_t soundBuf[MAX_PATH];
-    GetWindowTextW(m_hEditSoundFile, soundBuf, MAX_PATH);
-    a.soundFile = soundBuf;
+    {
+        int len = GetWindowTextLengthW(m_hEditSoundFile);
+        std::wstring sf(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+        if (len > 0) GetWindowTextW(m_hEditSoundFile, &sf[0], len + 1);
+        a.soundFile = sf;   // no MAX_PATH truncation
+    }
     GetWindowTextW(m_hEditSnooze, buf, 32);
-    a.snoozeMinutes = (std::clamp)(_wtoi(buf), 1, 100000);   // match Storage clamp
+    a.snoozeMinutes = (std::clamp)(_wtoi(buf), 1, kMaxSnoozeMinutes);
     a.paused = SendMessageW(m_hChkPaused, BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-    // Reset runtime state on config change (user edited the alarm)
-    a.firedCount = 0;
-    a.snoozeUntil = 0;
-
-    note->alarm = std::move(a);
 }
 
 void AlarmConfigDialog::UpdateControlStates() {
@@ -832,61 +906,10 @@ void AlarmConfigDialog::UpdateControlStates() {
 }
 
 void AlarmConfigDialog::UpdatePreview() {
-    // Build a transient AlarmConfig from current control state
+    // Transient config from the current control state - same reader as Save,
+    // so the preview can never disagree with what gets stored.
     AlarmConfig a;
-    SYSTEMTIME dt, tm;
-    SendMessageW(m_hStartDate, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&dt));
-    SendMessageW(m_hStartTime, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&tm));
-    a.startTime.wYear   = dt.wYear;
-    a.startTime.wMonth  = dt.wMonth;
-    a.startTime.wDay    = dt.wDay;
-    a.startTime.wHour   = tm.wHour;
-    a.startTime.wMinute = tm.wMinute;
-    a.startTime.wSecond = 0;
-    // Populate wDayOfWeek via round-trip (else the Weekly preview is wrong for a
-    // future start date — matches WriteToNote).
-    FILETIME ftPv;
-    if (SystemTimeToFileTime(&a.startTime, &ftPv))
-        FileTimeToSystemTime(&ftPv, &a.startTime);
-
-    if (SendMessageW(m_hRbOnce, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::Once;
-    else if (SendMessageW(m_hRbDaily, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::Daily;
-    else if (SendMessageW(m_hRbEveryN, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::EveryNDays;
-    else if (SendMessageW(m_hRbWeekly, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::Weekly;
-    else if (SendMessageW(m_hRbMonthly, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-        a.kind = (SendMessageW(m_hRbMonthlyNth, BM_GETCHECK, 0, 0) == BST_CHECKED)
-                     ? AlarmKind::MonthlyNth : AlarmKind::MonthlyDay;
-    }
-    else if (SendMessageW(m_hRbQuarterly, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::Quarterly;
-    else if (SendMessageW(m_hRbYearly, BM_GETCHECK, 0, 0) == BST_CHECKED) a.kind = AlarmKind::Yearly;
-
-    wchar_t buf[32];
-    GetWindowTextW(m_hEditEveryN, buf, 32);
-    a.intervalDays = (std::clamp)(_wtoi(buf), 1, 365);   // match Storage clamp
-
-    for (int i = 0; i < 7; ++i) {
-        if (SendMessageW(m_hChkWd[i], BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            a.weekdayMask |= static_cast<uint8_t>(1u << kDisplayToMaskBit[i]);
-        }
-    }
-    GetWindowTextW(m_hEditMonthlyDay, buf, 32);
-    a.monthDay = (std::clamp)(_wtoi(buf), 1, 31);
-    GetWindowTextW(m_hEditMonthlyNth, buf, 32);
-    a.nthWeek = (std::clamp)(_wtoi(buf), 1, 5);
-    LRESULT cbIdx = SendMessageW(m_hComboMonthlyWd, CB_GETCURSEL, 0, 0);
-    if (cbIdx >= 0 && cbIdx < 7) a.nthWeekday = kDisplayToMaskBit[cbIdx];
-    GetWindowTextW(m_hEditQuarterDay, buf, 32);
-    a.quarterDay = (std::clamp)(_wtoi(buf), 1, 90);
-
-    if (SendMessageW(m_hRbEndNever, BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::Never;
-    else if (SendMessageW(m_hRbEndAfterN, BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::AfterN;
-    else if (SendMessageW(m_hRbEndOnDate, BM_GETCHECK, 0, 0) == BST_CHECKED) a.endKind = AlarmEndKind::OnDate;
-
-    SYSTEMTIME endDt;
-    SendMessageW(m_hEndDate, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&endDt));
-    a.endDate = endDt;
-
-    a.paused = SendMessageW(m_hChkPaused, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    ReadControls(a);
 
     SYSTEMTIME now;
     GetLocalTime(&now);
@@ -908,17 +931,21 @@ void AlarmConfigDialog::UpdatePreview() {
 }
 
 void AlarmConfigDialog::BrowseSoundFile() {
-    wchar_t file[MAX_PATH] = {};
-    GetWindowTextW(m_hEditSoundFile, file, MAX_PATH);
+    // Long-path safe buffer: GetOpenFileName fails silently (FNERR_BUFFERTOOSMALL)
+    // when the chosen path does not fit.
+    std::vector<wchar_t> file(32768, L'\0');
+    GetWindowTextW(m_hEditSoundFile, file.data(), static_cast<int>(file.size()));
 
     OPENFILENAMEW ofn = { sizeof(ofn) };
     ofn.hwndOwner   = m_hwnd;
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrFilter = L"Wave files (*.wav)\0*.wav\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
+    // PlaySound only plays RIFF/WAVE; offering *.* let users pick an .mp3 that
+    // produced a silent alarm (IsWaveFile guards playback, the filter guides).
+    ofn.lpstrFilter = L"Wave files (*.wav)\0*.wav\0";
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
     if (GetOpenFileNameW(&ofn)) {
-        SetWindowTextW(m_hEditSoundFile, file);
+        SetWindowTextW(m_hEditSoundFile, file.data());
     }
 }
 

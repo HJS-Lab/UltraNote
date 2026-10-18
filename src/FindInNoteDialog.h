@@ -41,6 +41,8 @@ private:
     HWND        m_hWhole    = nullptr;
     HWND        m_hFindBtn  = nullptr;
     HWND        m_hCloseBtn = nullptr;
+    HFONT       m_hFont     = nullptr;   // message font at m_dpi (owned)
+    UINT        m_dpi       = 96;        // owner note's monitor DPI at creation
 
     static constexpr UINT_PTR EDIT_SUBCLASS_ID = 1;
     static bool s_classRegistered;

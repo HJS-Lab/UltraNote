@@ -14,6 +14,7 @@
 #include <optional>
 #include <unordered_set>
 #include <shellapi.h>
+#include <windowsx.h>   // GET_X_LPARAM for the V4 tray callback anchor point
 #include <mmsystem.h>   // PlaySoundW for the windowless sound-only alarm path
 
 static const wchar_t* APP_WND_CLASS = L"UltraNoteApp";
@@ -22,6 +23,13 @@ static const wchar_t* MUTEX_NAME    = L"UltraNoteInstance";
 // Defined later in this translation unit; forward-declared so the startup
 // off-screen-healing pass in Initialize can reuse the same monitor check.
 static bool IsRectOnAnyMonitor(int x, int y, int w, int h);
+
+static bool SameLayout(const NoteLayout& a, const NoteLayout& b) {
+    return a.backgroundColor == b.backgroundColor && a.textColor == b.textColor &&
+           a.borderColor == b.borderColor && a.fontFace == b.fontFace &&
+           a.fontSizePts == b.fontSizePts && a.fontBold == b.fontBold &&
+           a.fontItalic == b.fontItalic && a.alwaysOnTop == b.alwaysOnTop;
+}
 
 Application& Application::Get() {
     static Application instance;
@@ -51,38 +59,65 @@ bool Application::Initialize(HINSTANCE hInst) {
     NoteListWindow::RegisterWindowClass(hInst);
 
     if (!CreateAppWindow()) return false;
-    if (!SetupTrayIcon()) return false;
-
-    m_trayBubble = std::make_unique<TrayBubbleWindow>();
-    m_trayBubble->Create(hInst);
 
     LoadMenuBitmaps();
 
     // Load saved notes. If notes.json was partially unparsable, LoadNotes has
     // already backed up the raw file (notes.json.bak); warn the user so the
     // partial save that follows doesn't look like silent data loss.
+    // If the file EXISTS but cannot be read (sync client holding it, ACL, I/O
+    // error) we must not start with an empty store: the first autosave would
+    // overwrite the real notes. Retry a few times (locks are usually short),
+    // then let the user retry again or quit - never "continue anyway".
+    // Silent retries with backoff first (~10 s total): sync clients and virus
+    // scanners hold the file briefly at logon. The tray icon does not exist
+    // yet, so nothing can create notes while the MessageBox pumps messages.
     bool notesCorrupt = false;
-    m_notes = Storage::LoadNotes(m_nextId, m_folders, notesCorrupt);
+    bool notesUnreadable = false;
+    static const DWORD kRetryDelaysMs[] = { 250, 500, 1000, 2000, 3000, 4000 };
+    for (size_t attempt = 0;; ++attempt) {
+        m_notes = Storage::LoadNotes(m_nextId, m_folders, notesCorrupt, notesUnreadable);
+        if (!notesUnreadable) break;
+        if (attempt < _countof(kRetryDelaysMs)) { Sleep(kRetryDelaysMs[attempt]); continue; }
+        int choice = MessageBoxW(nullptr, Ls(L"error.notes_unreadable").c_str(),
+                                 L"UltraNote", MB_RETRYCANCEL | MB_ICONERROR);
+        if (choice != IDRETRY) return false;
+        attempt = static_cast<size_t>(-1);   // next ++ restarts the silent retry round
+    }
     if (notesCorrupt) {
         MessageBoxW(nullptr, Ls(L"error.notes_corrupt").c_str(), L"UltraNote",
                     MB_OK | MB_ICONWARNING);
     }
 
-    // Heal nextId and drop duplicate ids: if the stored nextId is <= an existing
-    // note id (corrupted/hand-edited file), CreateNewNote would hand out a
-    // colliding id and clobber a live note (orphaned window, double-delete UAF).
+    // Heal note ids: if the stored nextId is <= an existing note id (corrupted
+    // or hand-edited file), CreateNewNote would hand out a colliding id and
+    // clobber a live note (orphaned window, double-delete UAF). Notes with an
+    // invalid id (0 = parser saw <= 0) or a duplicate id get a FRESH id instead
+    // of being dropped - no note is lost, only its id changes.
     {
         std::unordered_set<uint64_t> seenIds;
-        for (auto it = m_notes.begin(); it != m_notes.end(); ) {
-            uint64_t id = (*it)->id;
-            if (!seenIds.insert(id).second) {
-                it = m_notes.erase(it);   // duplicate id: drop the later note
+        std::vector<NoteData*> needFreshId;
+        for (auto& note : m_notes) {
+            uint64_t id = note->id;
+            if (id == 0 || !seenIds.insert(id).second) {
+                needFreshId.push_back(note.get());
                 continue;
             }
             if (id >= m_nextId) m_nextId = id + 1;
-            ++it;
+        }
+        for (NoteData* n : needFreshId) {
+            n->id = m_nextId++;
+            m_dirty = true;
         }
     }
+
+    // Tray icon + hover bubble only now: the modal boxes above must not offer
+    // tray commands on a half-initialised store. Not fatal when NIM_ADD fails
+    // (taskbar not up yet at autostart): SetupTrayIcon re-arms itself via
+    // IDT_TRAY_RETRY and the TaskbarCreated broadcast re-adds it as well.
+    SetupTrayIcon();
+    m_trayBubble = std::make_unique<TrayBubbleWindow>();
+    m_trayBubble->Create(hInst);
 
     // Apply saved settings (autosave interval, cascade positions, etc.) BEFORE
     // creating note windows so off-screen healing below can use the configured
@@ -102,10 +137,7 @@ bool Application::Initialize(HINSTANCE hInst) {
                                      note->height > 0 ? note->height : 150)) {
                 note->x = m_cascadeX;
                 note->y = m_cascadeY;
-                m_cascadeX += settings.cascadeStep;
-                m_cascadeY += settings.cascadeStep;
-                if (m_cascadeX > settings.cascadeReset) m_cascadeX = settings.newNoteX;
-                if (m_cascadeY > settings.cascadeReset) m_cascadeY = settings.newNoteY;
+                AdvanceCascade(settings);
                 m_dirty = true;
             }
         }
@@ -128,6 +160,7 @@ bool Application::Initialize(HINSTANCE hInst) {
     m_noteListWindow = std::make_unique<NoteListWindow>(m_hInst);
     m_noteListWindow->Create();
 
+    m_initialized = true;
     return true;
 }
 
@@ -169,11 +202,26 @@ int Application::Run() {
 }
 
 void Application::Shutdown() {
-    CommitEditingNotes();   // flush in-progress edits before the save
-    SaveAll();
+    // Stop every input source first: the retry MessageBox below pumps messages,
+    // and hotkeys/timers/tray commands must not create notes or fire alarms
+    // in the middle of the teardown.
+    m_initialized = false;
     UnregisterGlobalHotkeys();
     KillTimer(m_hAppWnd, IDT_AUTOSAVE);
     KillTimer(m_hAppWnd, IDT_ALARM);
+    KillTimer(m_hAppWnd, IDT_TRAY_RETRY);
+
+    CommitEditingNotes();   // flush in-progress edits before the save
+    // A failed save at exit would silently drop the session's changes: let the
+    // user clear the cause (locked file / full disk) and retry before we go.
+    auto saveOrAsk = [this]() {
+        while (!SaveAll()) {
+            if (MessageBoxW(nullptr, Ls(L"error.notes_save_failed_exit").c_str(),
+                            L"UltraNote", MB_RETRYCANCEL | MB_ICONERROR) != IDRETRY)
+                break;
+        }
+    };
+    saveOrAsk();
 
     // Close any open alarm popups (they self-delete on WM_NCDESTROY)
     // Make a local copy because DestroyWindow triggers map mutation via OnAlarmPopupClosed
@@ -184,10 +232,10 @@ void Application::Shutdown() {
     m_alarmPopups.clear();
 
     // Destroying popups fires OnAlarmPopupClosed(Dismiss) -> AdvanceAfterFire +
-    // MarkDirty. That happens AFTER the SaveAll above, so persist once more here,
+    // MarkDirty. That happens AFTER the save above, so persist once more here,
     // otherwise a once-alarm re-pops on the next start (SaveAll early-outs if not
     // dirty, so this is cheap when nothing changed).
-    SaveAll();
+    saveOrAsk();
 
     if (m_trayBubble) {
         m_trayBubble->Destroy();
@@ -195,6 +243,7 @@ void Application::Shutdown() {
     }
 
     RemoveTrayIcon();
+    if (m_hTrayIcon) { DestroyIcon(m_hTrayIcon); m_hTrayIcon = nullptr; }
 
     // Destroy note windows
     for (auto& [id, wnd] : m_noteWindows) {
@@ -260,13 +309,36 @@ LRESULT Application::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
 
+    // Before Initialize finished / during Shutdown: no user-driven commands
+    // (see m_initialized). Session-end and TaskbarCreated still get through.
+    if (!m_initialized && (msg == WM_TRAY_CALLBACK || msg == WM_COMMAND ||
+                           msg == WM_HOTKEY || msg == WM_TIMER ||
+                           msg == WM_NOTE_REQUEST_DELETE || msg == WM_NOTE_CHANGED))
+        return 0;
+
     switch (msg) {
         case WM_TRAY_CALLBACK: {
             UINT trayMsg = LOWORD(lParam);
-            if (trayMsg == WM_RBUTTONUP) {
+            // NOTIFYICON_VERSION_4 sends WM_CONTEXTMENU for the right-click
+            // release AND for the keyboard (Win+B, then Shift+F10/menu key), with
+            // the anchor point in wParam. WM_RBUTTONUP is kept as a fallback for
+            // shells that don't; the open-flag/tick guard makes sure one click
+            // can never open the menu twice. NIN_KEYSELECT (Enter/Space on the
+            // icon) mirrors the double-click action.
+            if (trayMsg == WM_CONTEXTMENU || trayMsg == WM_RBUTTONUP) {
+                if (m_trayMenuOpen || GetTickCount64() - m_trayMenuTick < 500) return 0;
+                m_trayMenuTick = GetTickCount64();
                 HideTrayBubble();
-                ShowTrayMenu();
-            } else if (trayMsg == WM_LBUTTONDBLCLK) {
+                POINT pt;
+                if (trayMsg == WM_CONTEXTMENU) pt = { GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam) };
+                else GetCursorPos(&pt);
+                ShowTrayMenu(pt.x, pt.y);
+            } else if (trayMsg == WM_LBUTTONDBLCLK || trayMsg == NIN_KEYSELECT) {
+                // The shell sends NIN_KEYSELECT twice for Enter: debounce.
+                if (trayMsg == NIN_KEYSELECT) {
+                    if (GetTickCount64() - m_trayKeySelectTick < 500) return 0;
+                    m_trayKeySelectTick = GetTickCount64();
+                }
                 HideTrayBubble();
                 auto data = SettingsDialog::LoadFromStorage();
                 switch (data.trayDoubleClick) {
@@ -324,6 +396,8 @@ LRESULT Application::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 SaveAll();
             } else if (wParam == IDT_ALARM) {
                 CheckDueAlarms();
+            } else if (wParam == IDT_TRAY_RETRY) {
+                SetupTrayIcon();   // kills the timer on success, re-arms on failure
             }
             return 0;
         }
@@ -331,7 +405,30 @@ LRESULT Application::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_QUERYENDSESSION:
             CommitEditingNotes();   // commit edits in flight before the session ends
             SaveAll();
+            // The note list persists its layout in Hide()/destructor only, which
+            // never run on logoff with the list open - do it here.
+            if (m_noteListWindow) m_noteListWindow->PersistLayout();
             return TRUE;
+
+        case WM_ENDSESSION:
+            // The session really ends now (no veto possible): commit + save once
+            // more - edits may have happened between QUERY and END - and drop
+            // the tray icon so the shell doesn't keep a stale entry.
+            if (wParam) {
+                CommitEditingNotes();
+                SaveAll();
+                RemoveTrayIcon();
+            }
+            return 0;
+
+        case WM_CLOSE:
+            // External close request (taskkill without /F, "End task", or a note
+            // window forwarding its own WM_CLOSE): leave through the normal exit
+            // path so Shutdown() saves and cleans up. DefWindowProc would just
+            // destroy this window and leave a zombie process without tray,
+            // autosave or alarms - and its mutex would block the next start.
+            PostQuitMessage(0);
+            return 0;
 
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -352,9 +449,31 @@ bool Application::SetupTrayIcon() {
     // The szTip also serves as a fallback for shells that don't support V4.
     m_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     m_nid.uCallbackMessage = WM_TRAY_CALLBACK;
-    m_nid.hIcon            = LoadIconW(m_hInst, MAKEINTRESOURCE(IDI_TRAY));
+    // LoadIconMetric picks the frame for the tray's small-icon size (16/20 px
+    // at 100/125 %); LoadIconW returned the 32 px frame which the shell then
+    // downscaled - blurry. Loaded once (SetupTrayIcon re-runs on TaskbarCreated).
+    if (!m_hTrayIcon) {
+        if (FAILED(LoadIconMetric(m_hInst, MAKEINTRESOURCEW(IDI_TRAY), LIM_SMALL, &m_hTrayIcon)))
+            m_hTrayIcon = nullptr;
+    }
+    m_nid.hIcon            = m_hTrayIcon ? m_hTrayIcon
+                                         : LoadIconW(m_hInst, MAKEINTRESOURCE(IDI_TRAY));
     wcscpy_s(m_nid.szTip, L"UltraNote");
-    if (!Shell_NotifyIconW(NIM_ADD, &m_nid)) return false;
+    if (!Shell_NotifyIconW(NIM_ADD, &m_nid)) {
+        // Already present (TaskbarCreated re-add while the icon survived)? Then
+        // NIM_MODIFY succeeds and we are done. Otherwise the shell is not ready
+        // (autostart during logon): retry via timer a few times, so a missing
+        // TaskbarCreated broadcast doesn't leave the whole session without icon.
+        if (!Shell_NotifyIconW(NIM_MODIFY, &m_nid)) {
+            if (m_trayRetries < 10) {
+                ++m_trayRetries;
+                SetTimer(m_hAppWnd, IDT_TRAY_RETRY, TRAY_RETRY_MS, nullptr);
+            }
+            return false;
+        }
+    }
+    KillTimer(m_hAppWnd, IDT_TRAY_RETRY);
+    m_trayRetries = 0;
 
     // NOTIFYICON_VERSION_4: enables NIN_POPUPOPEN/CLOSE hover notifications.
     // Changes callback lParam encoding, but our existing LOWORD(lParam)-based
@@ -366,6 +485,19 @@ bool Application::SetupTrayIcon() {
 
 void Application::RemoveTrayIcon() {
     Shell_NotifyIconW(NIM_DELETE, &m_nid);
+}
+
+void Application::ShowTrayBalloon(const std::wstring& text, DWORD infoFlags) {
+    if (!m_nid.hWnd) return;
+    // Non-blocking (a MessageBox from a timer/startup path would block the
+    // caller). Restore uFlags afterwards so later NIM_MODIFY calls don't replay.
+    UINT savedFlags = m_nid.uFlags;
+    m_nid.uFlags = NIF_INFO;
+    m_nid.dwInfoFlags = infoFlags;
+    wcscpy_s(m_nid.szInfoTitle, L"UltraNote");
+    wcsncpy_s(m_nid.szInfo, text.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &m_nid);
+    m_nid.uFlags = savedFlags;
 }
 
 void Application::LoadMenuBitmaps() {
@@ -598,7 +730,7 @@ void Application::ShowAboutDialog(HWND hParent) {
                             hParent, dlgProc, 0);
 }
 
-void Application::ShowTrayMenu() {
+void Application::ShowTrayMenu(int x, int y) {
     HMENU hPopup = CreatePopupMenu();
     if (!hPopup) return;
 
@@ -635,15 +767,41 @@ void Application::ShowTrayMenu() {
     AppendMenuItemRes(hPopup, ID_TRAY_EXIT, Ls(L"menu.exit").c_str(),
                       IDI_EXIT);
 
-    POINT pt;
-    GetCursorPos(&pt);
-
     // Required for tray menus to dismiss properly
     SetForegroundWindow(m_hAppWnd);
-    TrackPopupMenu(hPopup, TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hAppWnd, nullptr);
+    m_trayMenuOpen = true;
+    TrackPopupMenu(hPopup, TPM_RIGHTBUTTON, x, y, 0, m_hAppWnd, nullptr);
+    m_trayMenuOpen = false;
     PostMessageW(m_hAppWnd, WM_NULL, 0, 0);
 
     DestroyMenu(hPopup);
+}
+
+void Application::SetCascadeOrigin(int x, int y) {
+    // newnote.x/y can be set up to 3000 and the monitor layout can change: a
+    // start position on no monitor would create every new note off-screen,
+    // and the off-screen healing falls back to exactly this position, so it
+    // must itself be visible. Fall back to the primary work area.
+    if (!IsRectOnAnyMonitor(x, y, 200, 150)) {
+        RECT wa = {};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+            x = wa.left + 20;
+            y = wa.top + 20;
+        } else {
+            x = 20;
+            y = 20;
+        }
+    }
+    m_cascadeX = x;
+    m_cascadeY = y;
+}
+
+void Application::AdvanceCascade(const SettingsData& settings) {
+    int x = m_cascadeX + settings.cascadeStep;
+    int y = m_cascadeY + settings.cascadeStep;
+    if (x > settings.cascadeReset) x = settings.newNoteX;
+    if (y > settings.cascadeReset) y = settings.newNoteY;
+    SetCascadeOrigin(x, y);
 }
 
 // ============================================================================
@@ -681,10 +839,7 @@ NoteWindow* Application::CreateNewNote() {
     }
 
     // Cascade position for next note
-    m_cascadeX += settings.cascadeStep;
-    m_cascadeY += settings.cascadeStep;
-    if (m_cascadeX > settings.cascadeReset) m_cascadeX = settings.newNoteX;
-    if (m_cascadeY > settings.cascadeReset) m_cascadeY = settings.newNoteY;
+    AdvanceCascade(settings);
 
     NoteData* raw = note.get();
     m_notes.push_back(std::move(note));
@@ -756,6 +911,29 @@ void Application::RequestDeleteNote(uint64_t id) {
 }
 
 void Application::RemoveNote(uint64_t id) {
+    // A modal dialog owned by this note window (file picker, message box, alarm
+    // config) is still on the stack: deleting the NoteWindow now would free the
+    // object under that dialog's frame (use-after-free on return). Refuse.
+    {
+        auto wit = m_noteWindows.find(id);
+        if (wit != m_noteWindows.end() && wit->second->GetHwnd() &&
+            !IsWindowEnabled(wit->second->GetHwnd())) {
+            MessageBeep(MB_ICONEXCLAMATION);
+            return;
+        }
+    }
+
+    // Close an alarm popup still open for this note: it would keep looping its
+    // sound and later report an action for a note that no longer exists.
+    // DestroyWindow -> WM_NCDESTROY -> OnAlarmPopupClosed erases the map entry
+    // (the note still exists at that point, so its bookkeeping is harmless).
+    auto pit = m_alarmPopups.find(id);
+    if (pit != m_alarmPopups.end() && pit->second && pit->second->GetHwnd()) {
+        DestroyWindow(pit->second->GetHwnd());
+    }
+    m_alarmPopups.erase(id);
+    m_lastFiredMinute.erase(id);
+
     // Destroy window
     auto it = m_noteWindows.find(id);
     if (it != m_noteWindows.end()) {
@@ -778,8 +956,11 @@ void Application::FinalizeDeletions() {
     // window can cause sibling tool windows to lose visibility)
     for (auto& [nid, wnd] : m_noteWindows) {
         if (!wnd->GetData()->isHidden) {
+            // SWP_NOACTIVATE: this runs after a delete from the note list; an
+            // activated sibling note would take the keyboard, and the next Del
+            // (default shortcut, confirmation defaults to Yes) hit the wrong note.
             SetWindowPos(wnd->GetHwnd(), HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
             if (!wnd->GetData()->layout.alwaysOnTop) {
                 SetWindowPos(wnd->GetHwnd(), HWND_NOTOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -833,10 +1014,22 @@ void Application::MarkDirty() {
     m_dirty = true;
 }
 
-void Application::SaveAll() {
-    if (!m_dirty) return;
-    Storage::SaveNotes(m_notes, m_nextId, m_folders);
+bool Application::SaveAll() {
+    if (!m_dirty) return true;
+    if (!Storage::SaveNotes(m_notes, m_nextId, m_folders)) {
+        // Keep m_dirty set so the next autosave tick / shutdown retries, and
+        // tell the user once per failure streak. Previously the flag was
+        // cleared regardless, so a locked file or full disk silently lost the
+        // last changes at exit.
+        if (!m_saveFailedNotified) {
+            m_saveFailedNotified = true;
+            ShowTrayBalloon(Ls(L"error.notes_save_failed"), NIIF_ERROR);
+        }
+        return false;
+    }
+    m_saveFailedNotified = false;
     m_dirty = false;
+    return true;
 }
 
 void Application::CommitEditingNotes() {
@@ -908,7 +1101,6 @@ void Application::MoveSelectedNotes(int dx, int dy, uint64_t excludeId) {
 // ============================================================================
 
 void Application::ShowAllNotes() {
-    m_notesVisible = true;
     for (auto& note : m_notes) {
         note->isHidden = false;
         auto it = m_noteWindows.find(note->id);
@@ -923,7 +1115,6 @@ void Application::ShowAllNotes() {
 }
 
 void Application::HideAllNotes() {
-    m_notesVisible = false;
     for (auto& note : m_notes) {
         note->isHidden = true;
         auto it = m_noteWindows.find(note->id);
@@ -975,33 +1166,28 @@ void Application::SetSearchHighlight(const std::wstring& term) {
 // ============================================================================
 
 NoteWindow* Application::ShowNotePreview(uint64_t id) {
+    // The preview is purely visual: the note's persistent isHidden flag is NOT
+    // touched (an autosave/shutdown during the preview used to store
+    // isHidden=false and every hover rewrote notes.json), and the window is
+    // shown WITHOUT activation so the keyboard stays in the note list (Del/F2
+    // there must not hit the previewed note). The NoteWindow ctor creates the
+    // window invisible for hidden notes; the caller positions it.
     auto it = m_noteWindows.find(id);
     if (it == m_noteWindows.end()) {
-        // Note has no window (hidden) - create one
         NoteData* data = FindNoteData(id);
         if (!data) return nullptr;
-        data->isHidden = false;
         CreateNoteWindow(data);
         it = m_noteWindows.find(id);
-        m_dirty = true;
-    } else if (it->second->GetData()->isHidden) {
-        it->second->GetData()->isHidden = false;
-        it->second->Show(true);
-        m_dirty = true;
     }
-    it->second->BringToFront();
+    it->second->Show(true);   // SW_SHOWNOACTIVATE
     return it->second;
 }
 
 void Application::HideNotePreview(uint64_t id) {
-    NoteData* data = FindNoteData(id);
-    if (!data) return;
-    data->isHidden = true;
     auto it = m_noteWindows.find(id);
     if (it != m_noteWindows.end()) {
-        it->second->Show(false);
+        it->second->Show(false);   // data untouched (still isHidden)
     }
-    m_dirty = true;
 }
 
 bool Application::IsNoteVisible(uint64_t id) const {
@@ -1076,10 +1262,6 @@ static bool IsRectOnAnyMonitor(int x, int y, int w, int h) {
     return MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
 }
 
-// Build a "(N)" buffer for printf-style success messages.
-// Safe single-integer placeholder substitution. NEVER passes the (localized,
-// translator-editable) .lng string to the CRT format engine — a wrong specifier
-// there would crash or overflow a fixed buffer.
 // Convert "Filter Label|*.ext|...||" with '|' as separators into a buffer with
 // '\0' separators expected by GetSaveFileName/GetOpenFileName.
 static std::wstring BuildOfnFilter(const std::wstring& src) {
@@ -1094,16 +1276,7 @@ static std::wstring BuildOfnFilter(const std::wstring& src) {
 }
 
 void Application::ExportNotesByIds(HWND owner, const std::vector<uint64_t>& ids) {
-    // Resolve IDs to NoteData* in their natural order from m_notes
-    std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
-    std::vector<const NoteData*> selected;
-    selected.reserve(ids.size());
-    for (const auto& note : m_notes) {
-        if (idSet.count(note->id)) {
-            selected.push_back(note.get());
-        }
-    }
-    if (selected.empty()) return;
+    if (ids.empty()) return;
 
     // Default filename: "<export.default_name>-YYYY-MM-DD.unote"
     SYSTEMTIME st;
@@ -1112,9 +1285,10 @@ void Application::ExportNotesByIds(HWND owner, const std::vector<uint64_t>& ids)
     swprintf_s(dateBuf, L"-%04u-%02u-%02u", st.wYear, st.wMonth, st.wDay);
     std::wstring defaultName = Ls(L"export.default_name") + dateBuf + L".unote";
 
-    // GetSaveFileName: editable buffer must be MAX_PATH-sized
-    wchar_t fileBuf[MAX_PATH];
-    wcsncpy_s(fileBuf, defaultName.c_str(), _TRUNCATE);
+    // GetSaveFileName needs an editable buffer; size it for long paths (on a
+    // MAX_PATH buffer the dialog fails silently with FNERR_BUFFERTOOSMALL).
+    std::vector<wchar_t> fileBuf(32768, L'\0');
+    wcsncpy_s(fileBuf.data(), fileBuf.size(), defaultName.c_str(), _TRUNCATE);
 
     std::wstring filter = BuildOfnFilter(Ls(L"export.filter"));
     std::wstring title  = Ls(L"export.title");
@@ -1123,15 +1297,25 @@ void Application::ExportNotesByIds(HWND owner, const std::vector<uint64_t>& ids)
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = owner;
     ofn.lpstrFilter = filter.c_str();
-    ofn.lpstrFile   = fileBuf;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = fileBuf.data();
+    ofn.nMaxFile    = static_cast<DWORD>(fileBuf.size());
     ofn.lpstrTitle  = title.c_str();
     ofn.lpstrDefExt = L"unote";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (!GetSaveFileNameW(&ofn)) return;
 
-    if (!Storage::ExportNotes(fileBuf, selected)) {
+    // Resolve IDs only AFTER the modal dialog: it pumps messages, so a note may
+    // have been deleted meanwhile (a NoteData* taken earlier would dangle).
+    std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
+    std::vector<const NoteData*> selected;
+    selected.reserve(ids.size());
+    for (const auto& note : m_notes) {
+        if (idSet.count(note->id)) selected.push_back(note.get());
+    }
+    if (selected.empty()) return;
+
+    if (!Storage::ExportNotes(fileBuf.data(), selected)) {
         MessageBoxW(owner, Ls(L"export.error_save").c_str(), L"UltraNote",
                     MB_OK | MB_ICONERROR);
         return;
@@ -1142,7 +1326,7 @@ void Application::ExportNotesByIds(HWND owner, const std::vector<uint64_t>& ids)
 }
 
 void Application::ImportNotesFromFile(HWND owner) {
-    wchar_t fileBuf[MAX_PATH] = {};
+    std::vector<wchar_t> fileBuf(32768, L'\0');   // long-path safe (see Export)
     std::wstring filter = BuildOfnFilter(Ls(L"import.filter"));
     std::wstring title  = Ls(L"import.title");
 
@@ -1150,8 +1334,8 @@ void Application::ImportNotesFromFile(HWND owner) {
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = owner;
     ofn.lpstrFilter = filter.c_str();
-    ofn.lpstrFile   = fileBuf;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = fileBuf.data();
+    ofn.nMaxFile    = static_cast<DWORD>(fileBuf.size());
     ofn.lpstrTitle  = title.c_str();
     ofn.lpstrDefExt = L"unote";
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -1159,9 +1343,11 @@ void Application::ImportNotesFromFile(HWND owner) {
     if (!GetOpenFileNameW(&ofn)) return;
 
     std::vector<std::unique_ptr<NoteData>> imported;
-    if (!Storage::ImportNotes(fileBuf, imported)) {
-        MessageBoxW(owner, Ls(L"import.error_parse").c_str(), L"UltraNote",
-                    MB_OK | MB_ICONERROR);
+    bool unreadable = false;
+    if (!Storage::ImportNotes(fileBuf.data(), imported, unreadable)) {
+        MessageBoxW(owner,
+                    Ls(unreadable ? L"import.error_open" : L"import.error_parse").c_str(),
+                    L"UltraNote", MB_OK | MB_ICONERROR);
         return;
     }
     if (imported.empty()) {
@@ -1190,10 +1376,7 @@ void Application::ImportNotesFromFile(HWND owner) {
                                  note->height > 0 ? note->height : 150)) {
             note->x = m_cascadeX;
             note->y = m_cascadeY;
-            m_cascadeX += settings.cascadeStep;
-            m_cascadeY += settings.cascadeStep;
-            if (m_cascadeX > settings.cascadeReset) m_cascadeX = settings.newNoteX;
-            if (m_cascadeY > settings.cascadeReset) m_cascadeY = settings.newNoteY;
+            AdvanceCascade(settings);
         }
 
         // Folder: create on demand if it does not exist locally
@@ -1206,9 +1389,17 @@ void Application::ImportNotesFromFile(HWND owner) {
                 m_folders.push_back(note->folder);
                 std::sort(m_folders.begin(), m_folders.end(),
                           [](const std::wstring& a, const std::wstring& b) {
-                              return _wcsicmp(a.c_str(), b.c_str()) < 0;
+                              return CompareLocaleNoCase(a, b) < 0;
                           });
             }
+        }
+
+        // Alarm runtime state is machine-local: a lastFired/snooze taken over
+        // from the exporting PC would make the catch-up fire right after the
+        // import. The alarm is re-anchored at the next check like a new one.
+        if (note->alarm.has_value()) {
+            note->alarm->lastFiredSec = 0;
+            note->alarm->snoozeUntil  = 0;
         }
 
         // Move into live store and create window if visible
@@ -1265,63 +1456,60 @@ int LineHeight(HDC hdc, HFONT hFont) {
 // when rendered with `hFont` on `hdc`. Hard line breaks come from '\n' in the
 // source text. Long lines are broken at the last whitespace inside the longest
 // prefix that still fits; if no whitespace is available the cut is hard.
+// Works on pointer+length windows (no per-line substr copies) and measures at
+// most maxCharsPerLine characters per step: measuring the whole remainder for
+// every output line was O(L^2) on a 200k-character line.
 std::vector<std::wstring> WrapTextLines(HDC hdc, HFONT hFont,
                                          const std::wstring& text, int maxWidth) {
     std::vector<std::wstring> out;
     if (maxWidth <= 0) return out;
     HFONT old = static_cast<HFONT>(SelectObject(hdc, hFont));
 
-    auto width = [&](const wchar_t* s, int n) -> int {
-        if (n <= 0) return 0;
-        SIZE sz = {};
-        GetTextExtentPoint32W(hdc, s, n, &sz);
-        return sz.cx;
-    };
+    // Upper bound on characters per line: the narrowest glyph is practically
+    // never narrower than a third of the average width.
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(hdc, &tm);
+    int minCharW = tm.tmAveCharWidth > 3 ? tm.tmAveCharWidth / 3 : 1;
+    const size_t maxCharsPerLine = static_cast<size_t>(maxWidth / minCharW) + 2;
 
     size_t pos = 0;
     while (pos <= text.size()) {
         size_t nl = text.find(L'\n', pos);
-        std::wstring line = (nl == std::wstring::npos)
-            ? text.substr(pos)
-            : text.substr(pos, nl - pos);
-        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        size_t lineEnd = (nl == std::wstring::npos) ? text.size() : nl;
+        if (lineEnd > pos && text[lineEnd - 1] == L'\r') --lineEnd;
+        const wchar_t* line = text.data() + pos;
+        const size_t lineLen = lineEnd - pos;
 
-        if (line.empty()) {
+        if (lineLen == 0) {
             out.push_back(L"");
         } else {
             size_t lp = 0;
-            while (lp < line.size()) {
-                std::wstring rest = line.substr(lp);
-                if (width(rest.c_str(), static_cast<int>(rest.size())) <= maxWidth) {
-                    out.push_back(rest);
+            while (lp < lineLen) {
+                const size_t remaining = lineLen - lp;
+                const size_t window = remaining < maxCharsPerLine ? remaining : maxCharsPerLine;
+                const wchar_t* s = line + lp;
+                int fit = 0;
+                SIZE sz = {};
+                GetTextExtentExPointW(hdc, s, static_cast<int>(window), maxWidth,
+                                      &fit, nullptr, &sz);
+                if (static_cast<size_t>(fit) >= remaining) {
+                    out.emplace_back(s, remaining);
                     break;
                 }
-                // Binary search for max prefix length that fits
-                int lo = 1, hi = static_cast<int>(rest.size()), fit = 1;
-                while (lo <= hi) {
-                    int mid = (lo + hi) / 2;
-                    if (width(rest.c_str(), mid) <= maxWidth) {
-                        fit = mid;
-                        lo  = mid + 1;
-                    } else {
-                        hi = mid - 1;
-                    }
-                }
+                if (fit <= 0) fit = 1;   // always make progress
                 // Prefer breaking at last whitespace within the fitting prefix
                 int br = -1;
                 for (int j = fit; j > 0; --j) {
-                    wchar_t c = rest[j - 1];
+                    wchar_t c = s[j - 1];
                     if (c == L' ' || c == L'\t') { br = j; break; }
                 }
-                int take = (br > 0) ? br : fit;
-                std::wstring chunk = rest.substr(0, take);
-                while (!chunk.empty() &&
-                       (chunk.back() == L' ' || chunk.back() == L'\t')) {
-                    chunk.pop_back();
-                }
-                out.push_back(chunk);
+                size_t take = static_cast<size_t>((br > 0) ? br : fit);
+                size_t chunkLen = take;
+                while (chunkLen > 0 && (s[chunkLen - 1] == L' ' || s[chunkLen - 1] == L'\t'))
+                    --chunkLen;
+                out.emplace_back(s, chunkLen);
                 lp += take;
-                while (lp < line.size() && line[lp] == L' ') ++lp;
+                while (lp < lineLen && line[lp] == L' ') ++lp;
             }
         }
 
@@ -1338,29 +1526,36 @@ std::vector<std::wstring> WrapTextLines(HDC hdc, HFONT hFont,
 void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
     if (ids.empty()) return;
 
-    // Resolve IDs to NoteData* in the natural order of m_notes
-    std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
-    std::vector<const NoteData*> notes;
-    notes.reserve(ids.size());
-    for (const auto& n : m_notes) {
-        if (idSet.count(n->id)) {
-            notes.push_back(n.get());
-        }
-    }
-    if (notes.empty()) return;
-
     PRINTDLGW pd = {};
     pd.lStructSize = sizeof(pd);
     pd.hwndOwner   = owner;
-    pd.Flags       = PD_RETURNDC | PD_NOPAGENUMS | PD_NOSELECTION;
+    // PD_USEDEVMODECOPIESANDCOLLATE: the driver produces the requested number
+    // of copies; without it the "Copies" field of the dialog was ignored.
+    pd.Flags       = PD_RETURNDC | PD_NOPAGENUMS | PD_NOSELECTION |
+                     PD_USEDEVMODECOPIESANDCOLLATE;
     pd.nCopies     = 1;
-    if (!PrintDlgW(&pd)) {
+    if (!PrintDlgW(&pd) || !pd.hDC) {
+        if (pd.hDC)       DeleteDC(pd.hDC);
         if (pd.hDevMode)  GlobalFree(pd.hDevMode);
         if (pd.hDevNames) GlobalFree(pd.hDevNames);
         return;
     }
 
+    // Keep the owner (note or note list) disabled for the whole job: StartDocW
+    // can show a modal "Save as" prompt (file printers) that pumps messages,
+    // and RemoveNote refuses to delete a note whose window is disabled - so a
+    // note printed from its own window can't be freed under this stack frame.
+    // (PrintDlg re-enables its owner on close, hence disable only afterwards.)
+    struct ReenableOwner {
+        HWND h; bool on;
+        ~ReenableOwner() { if (on && IsWindow(h)) EnableWindow(h, TRUE); }
+    } reenable{ owner, owner && IsWindowEnabled(owner) };
+    if (reenable.on) EnableWindow(owner, FALSE);
+
     HDC hdc = pd.hDC;
+    // The DC's original font: re-selected before the per-note fonts are deleted
+    // (deleting a font while it is selected into the DC leaks it, once per print).
+    HFONT hOrigFont = static_cast<HFONT>(GetCurrentObject(hdc, OBJ_FONT));
     int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
     int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
     int marginX = MulDiv(50, dpiX, 254);   // 5 mm
@@ -1385,6 +1580,23 @@ void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
         return;
     }
 
+    // Resolve IDs only now - AFTER every modal dialog (PrintDlg and StartDoc's
+    // file prompt pump messages; a NoteData* taken earlier could dangle) - and
+    // COPY the notes so the job below is independent of m_notes either way.
+    std::unordered_set<uint64_t> idSet(ids.begin(), ids.end());
+    std::vector<NoteData> notes;
+    notes.reserve(ids.size());
+    for (const auto& n : m_notes) {
+        if (idSet.count(n->id)) notes.push_back(*n);
+    }
+    if (notes.empty()) {
+        AbortDoc(hdc);
+        DeleteDC(hdc);
+        if (pd.hDevMode)  GlobalFree(pd.hDevMode);
+        if (pd.hDevNames) GlobalFree(pd.hDevNames);
+        return;
+    }
+
     // Date format from settings (matches NoteListWindow::PopulateList)
     auto intSettings = Storage::LoadSettings();
     auto itDateFmt = intSettings.find(L"notelist.dateFormat");
@@ -1397,7 +1609,8 @@ void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
     bool ok = true;
     std::wstring pageFmt = Ls(L"print.page_label");
 
-    for (const NoteData* note : notes) {
+    for (const NoteData& noteCopy : notes) {
+        const NoteData* note = &noteCopy;
         int bodyPt  = note->layout.fontSizePts > 0 ? note->layout.fontSizePts : 10;
         int titlePt = bodyPt + 4;
         int metaPt  = (bodyPt - 2 > 8) ? (bodyPt - 2) : 8;
@@ -1496,6 +1709,7 @@ void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
 
             SelectObject(hdc, hBodyFont);
             SetTextColor(hdc, RGB(0, 0, 0));
+            const size_t pageStartIdx = bodyIdx;
             while (bodyIdx < bodyLines.size() && y + bodyH <= bodyBottom) {
                 const std::wstring& bl = bodyLines[bodyIdx];
                 if (!bl.empty()) {
@@ -1503,6 +1717,15 @@ void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
                              static_cast<int>(bl.size()));
                 }
                 y += bodyH;
+                ++bodyIdx;
+            }
+            // Guarantee progress: when not even one body line fits on a fresh
+            // (non-first) page - tiny label stock, huge font - print one anyway;
+            // otherwise the do/while below would spool pages forever.
+            if (!firstPage && bodyIdx == pageStartIdx && bodyIdx < bodyLines.size()) {
+                const std::wstring& bl = bodyLines[bodyIdx];
+                if (!bl.empty())
+                    TextOutW(hdc, printable.left, y, bl.c_str(), static_cast<int>(bl.size()));
                 ++bodyIdx;
             }
 
@@ -1520,6 +1743,7 @@ void Application::PrintNoteByIds(HWND owner, const std::vector<uint64_t>& ids) {
             firstPage = false;
         } while (bodyIdx < bodyLines.size());
 
+        SelectObject(hdc, hOrigFont);
         DeleteObject(hTitleFont);
         DeleteObject(hBodyFont);
         DeleteObject(hMetaFont);
@@ -1554,7 +1778,7 @@ void Application::AddFolder(const std::wstring& name) {
     m_folders.push_back(name);
     std::sort(m_folders.begin(), m_folders.end(),
               [](const std::wstring& a, const std::wstring& b) {
-                  return _wcsicmp(a.c_str(), b.c_str()) < 0;
+                  return CompareLocaleNoCase(a, b) < 0;
               });
     m_dirty = true;
     RefreshNoteList();
@@ -1569,7 +1793,7 @@ void Application::RenameFolder(const std::wstring& oldName, const std::wstring& 
     }
     std::sort(m_folders.begin(), m_folders.end(),
               [](const std::wstring& a, const std::wstring& b) {
-                  return _wcsicmp(a.c_str(), b.c_str()) < 0;
+                  return CompareLocaleNoCase(a, b) < 0;
               });
 
     // Update all notes in this folder
@@ -1612,10 +1836,6 @@ void Application::RenameNote(uint64_t noteId, const std::wstring& newTitle) {
 }
 
 // ============================================================================
-// Language
-// ============================================================================
-
-// ============================================================================
 // Settings
 // ============================================================================
 
@@ -1629,9 +1849,9 @@ void Application::ShowSettingsDialog() {
         m_noteListWindow->SetPreviewPaused(true);
     }
 
-    // Use the note list window as owner when it's visible. With the message-only
-    // app window as owner, Windows treats the dialog as ownerless from the user's
-    // perspective — the note list can cover it as soon as the dialog loses focus.
+    // Use the note list window as owner when it's visible. With the hidden app
+    // window as owner, Windows treats the dialog as ownerless from the user's
+    // perspective - the note list can cover it as soon as the dialog loses focus.
     // An owned dialog is kept above its owner in z-order, fixing that.
     HWND hOwner = (m_noteListWindow && m_noteListWindow->IsVisible())
                   ? m_noteListWindow->GetHwnd()
@@ -1655,9 +1875,8 @@ void Application::ShowSettingsDialog() {
 void Application::ApplySettings() {
     auto data = SettingsDialog::LoadFromStorage();
 
-    // Apply cascade start position
-    m_cascadeX = data.newNoteX;
-    m_cascadeY = data.newNoteY;
+    // Apply cascade start position (clamped to a visible monitor)
+    SetCascadeOrigin(data.newNoteX, data.newNoteY);
 
     // Apply autosave timer
     KillTimer(m_hAppWnd, IDT_AUTOSAVE);
@@ -1678,22 +1897,36 @@ void Application::ApplySettings() {
     defaultLayout.fontBold        = data.fontBold;
     defaultLayout.fontItalic      = data.fontItalic;
 
+    bool layoutChanged = false;
     for (auto& note : m_notes) {
         // Preserve per-note alwaysOnTop
-        bool ontop = note->layout.alwaysOnTop;
-        note->layout = defaultLayout;
-        note->layout.alwaysOnTop = ontop;
+        NoteLayout next = defaultLayout;
+        next.alwaysOnTop = note->layout.alwaysOnTop;
+        if (!SameLayout(note->layout, next)) {
+            note->layout = next;
+            layoutChanged = true;
+        }
     }
-    for (auto& [id, wnd] : m_noteWindows) {
-        InvalidateRect(wnd->GetHwnd(), nullptr, TRUE);
-    }
-    m_dirty = true;
+    // Mark dirty (= notes.json rewrite + disk flush) only when a note really
+    // changed: this runs at every start and on every Settings-OK.
+    if (layoutChanged) m_dirty = true;
+
+    // Repaint the notes when anything they render from changed
+    bool repaint = layoutChanged ||
+                   m_clickableLinks != data.clickableLinks ||
+                   m_searchHlColor  != data.searchHlColor;
 
     // Apply clickable links setting
     m_clickableLinks = data.clickableLinks;
 
     // Apply search highlight color
     m_searchHlColor = data.searchHlColor;
+
+    if (repaint) {
+        for (auto& [id, wnd] : m_noteWindows) {
+            InvalidateRect(wnd->GetHwnd(), nullptr, TRUE);
+        }
+    }
 
     // Apply preview setting to note list
     if (m_noteListWindow) {
@@ -1713,12 +1946,19 @@ void Application::ApplySettings() {
     // WM_COMMAND (see ShowSettingsDialog owner choice). Outside the dialog there
     // is no owner conflict, so rebuild immediately.
     if (data.language != Localization::Get().GetCurrentLanguage()) {
-        Localization::Get().LoadLanguage(data.language);
-        std::wstring iniPath = GetExeDirectory() + L"\\settings.ini";
-        WritePrivateProfileStringW(L"general", L"language",
-                                    data.language.c_str(), iniPath.c_str());
-        if (m_settingsOpen) m_pendingNoteListRebuild = true;
-        else                RebuildNoteListForLanguage();
+        std::wstring before = Localization::Get().GetCurrentLanguage();
+        if (Localization::Get().LoadLanguage(data.language)) {
+            std::wstring iniPath = GetExeDirectory() + L"\\settings.ini";
+            WritePrivateProfileStringW(L"general", L"language",
+                                        data.language.c_str(), iniPath.c_str());
+        }
+        // A broken/missing .lng leaves English loaded: rebuild only when the
+        // active language really changed, otherwise every Settings-OK would
+        // recreate the note list for nothing.
+        if (Localization::Get().GetCurrentLanguage() != before) {
+            if (m_settingsOpen) m_pendingNoteListRebuild = true;
+            else                RebuildNoteListForLanguage();
+        }
     }
 
     // Heal autostart entry: if the setting is on, ensure the Run-key value
@@ -1740,9 +1980,16 @@ void Application::RegisterGlobalHotkeys(const SettingsData& data) {
 
     bool anyFailed = false;
 
+    // The settings dialog refuses global bindings without Ctrl or Alt, but an
+    // older or hand-edited settings.json can still carry one (e.g. F9 or
+    // Shift+N) - RegisterHotKey would then hijack that key system-wide.
+    auto validGlobal = [](WORD hk) {
+        return hk != 0 && (HIBYTE(hk) & (HOTKEYF_CONTROL | HOTKEYF_ALT)) != 0;
+    };
+
     // Register global new note hotkey
     WORD hkNew = data.shortcuts[SC_GLOBAL_NEWNOTE];
-    if (hkNew != 0) {
+    if (validGlobal(hkNew)) {
         if (!RegisterHotKey(m_hAppWnd, IDH_GLOBAL_NEWNOTE,
                             HotkeyModsToRegisterMods(HIBYTE(hkNew)), LOBYTE(hkNew)))
             anyFailed = true;
@@ -1750,7 +1997,7 @@ void Application::RegisterGlobalHotkeys(const SettingsData& data) {
 
     // Register global note list hotkey
     WORD hkList = data.shortcuts[SC_GLOBAL_NOTELIST];
-    if (hkList != 0) {
+    if (validGlobal(hkList)) {
         if (!RegisterHotKey(m_hAppWnd, IDH_GLOBAL_NOTELIST,
                             HotkeyModsToRegisterMods(HIBYTE(hkList)), LOBYTE(hkList)))
             anyFailed = true;
@@ -1758,16 +2005,8 @@ void Application::RegisterGlobalHotkeys(const SettingsData& data) {
 
     // A configured combo already owned by another process fails silently;
     // surface it once via a non-blocking tray balloon (a MessageBox would
-    // block at startup). Restore uFlags so later NIM_MODIFY calls don't replay.
-    if (anyFailed && m_nid.hWnd) {
-        UINT savedFlags = m_nid.uFlags;
-        m_nid.uFlags = NIF_INFO;
-        m_nid.dwInfoFlags = NIIF_WARNING;
-        wcscpy_s(m_nid.szInfoTitle, L"UltraNote");
-        wcsncpy_s(m_nid.szInfo, Ls(L"hotkey.register_failed").c_str(), _TRUNCATE);
-        Shell_NotifyIconW(NIM_MODIFY, &m_nid);
-        m_nid.uFlags = savedFlags;
-    }
+    // block at startup).
+    if (anyFailed) ShowTrayBalloon(Ls(L"hotkey.register_failed"), NIIF_WARNING);
 }
 
 void Application::UnregisterGlobalHotkeys() {
@@ -1818,24 +2057,55 @@ static std::wstring FirstLinesOfText(const std::wstring& text, int maxLines, siz
 void Application::CheckDueAlarms() {
     SYSTEMTIME now;
     GetLocalTime(&now);
+    SYSTEMTIME nowFloor = now;
+    nowFloor.wSecond = 0;
+    nowFloor.wMilliseconds = 0;
 
     for (auto& note : m_notes) {
         if (!note->alarm.has_value()) continue;
         // Skip if a popup is already showing for this note
         if (m_alarmPopups.count(note->id)) continue;
+        AlarmConfig& alarm = *note->alarm;
 
-        auto nextFire = AlarmScheduler::ComputeNextFireTime(*note->alarm, now);
-        if (!nextFire.has_value()) continue;
-
-        if (AlarmScheduler::CompareSysTime(*nextFire, now) <= 0) {
-            // Throttle: don't re-fire the same occurrence-minute (the 30s timer
-            // can tick twice in one minute, and a quick dismiss would re-pop).
-            int64_t fireMin = AlarmScheduler::SysTimeToNaiveSec(*nextFire) / 60;
-            auto it = m_lastFiredMinute.find(note->id);
-            if (it != m_lastFiredMinute.end() && it->second == fireMin) continue;
-            m_lastFiredMinute[note->id] = fireMin;
-            TriggerAlarm(*note);
+        // Anchor the missed-occurrence catch-up for recurring alarms that have
+        // never fired (new alarm, re-configured schedule, or a notes.json from
+        // before lastFired existed): occurrences before this moment are not
+        // "missed". Paused alarms are anchored once they are resumed.
+        if (alarm.kind != AlarmKind::Once && alarm.lastFiredSec == 0 && !alarm.paused) {
+            // One minute back, so an occurrence in the current minute (an alarm
+            // just set for "now") still counts as after the anchor.
+            alarm.lastFiredSec = AlarmScheduler::SysTimeToNaiveSec(nowFloor) - 60;
+            MarkDirty();
         }
+
+        std::optional<SYSTEMTIME> fireAt;
+        auto nextFire = AlarmScheduler::ComputeNextFireTime(alarm, now);
+        if (nextFire.has_value() && AlarmScheduler::CompareSysTime(*nextFire, now) <= 0) {
+            fireAt = nextFire;
+        } else {
+            // Nothing due right now: did a recurring occurrence slip past while
+            // the app was not running or the PC slept? (Once needs no catch-up:
+            // its startTime keeps being returned above until it fires.)
+            fireAt = AlarmScheduler::ComputeMissedOccurrence(alarm, now);
+        }
+        if (!fireAt.has_value()) continue;
+
+        // Throttle: don't re-fire the same occurrence-minute (the 30s timer
+        // can tick twice in one minute, and a quick dismiss would re-pop).
+        int64_t fireMin = AlarmScheduler::SysTimeToNaiveSec(*fireAt) / 60;
+        auto it = m_lastFiredMinute.find(note->id);
+        if (it != m_lastFiredMinute.end() && it->second == fireMin) continue;
+        m_lastFiredMinute[note->id] = fireMin;
+        // Persisted counterpart of the throttle (recurring kinds): an occurrence
+        // already fired or acknowledged in an earlier session must not re-pop
+        // after a restart within the same minute. Once alarms stay excluded -
+        // one that was shown but never acknowledged must come back.
+        if (alarm.kind != AlarmKind::Once && alarm.lastFiredSec > 0 &&
+            fireMin * 60 <= alarm.lastFiredSec)
+            continue;
+        alarm.lastFiredSec = fireMin * 60;
+        MarkDirty();
+        TriggerAlarm(*note);
     }
 }
 
@@ -1850,14 +2120,14 @@ void Application::TriggerAlarm(NoteData& note) {
         if (a.sound) {
             // One-shot (no SND_LOOP): without a popup there is no Dismiss to stop
             // a looping sound. File check mirrors AlarmPopupWindow::StartSound.
+            // SND_NOSTOP: never cut off a popup's looping sound (the single
+            // PlaySound channel belongs to s_soundOwner); if the channel is busy
+            // PlaySound returns FALSE and the beep covers it. IsWaveFile: an
+            // unplayable file (.mp3) "succeeds" silently otherwise.
             bool played = false;
-            if (!a.soundFile.empty()) {
-                DWORD attrs = GetFileAttributesW(a.soundFile.c_str());
-                if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                    PlaySoundW(a.soundFile.c_str(), nullptr,
-                               SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-                    played = true;
-                }
+            if (IsWaveFile(a.soundFile)) {
+                played = PlaySoundW(a.soundFile.c_str(), nullptr,
+                                    SND_FILENAME | SND_ASYNC | SND_NODEFAULT | SND_NOSTOP) != FALSE;
             }
             if (!played) MessageBeep(MB_ICONEXCLAMATION);
         }
@@ -1889,8 +2159,7 @@ void Application::TriggerAlarm(NoteData& note) {
         while (stackIndex < static_cast<int>(used.size()) && used[stackIndex]) ++stackIndex;
     }
     auto popup = new AlarmPopupWindow(m_hInst, note.id, title, preview,
-                                      a.sound, a.soundFile,
-                                      a.snoozeMinutes, stackIndex);
+                                      a.sound, a.soundFile, stackIndex);
     if (!popup->Create()) {
         delete popup;
         return;
@@ -1907,15 +2176,26 @@ void Application::OnAlarmPopupClosed(uint64_t noteId, AlarmAction action) {
     SYSTEMTIME now;
     GetLocalTime(&now);
 
+    // Dismiss/Open acknowledge everything up to now: an occurrence that fell due
+    // while the popup was still open (CheckDueAlarms skips notes with an open
+    // popup) must not be caught up right after it - that looked like a double fire.
+    auto acknowledgeUpToNow = [&]() {
+        AlarmConfig& a = note->alarm.value();
+        int64_t nowMin = AlarmScheduler::SysTimeToNaiveSec(now) / 60 * 60;
+        if (a.kind != AlarmKind::Once && nowMin > a.lastFiredSec) a.lastFiredSec = nowMin;
+    };
+
     switch (action) {
         case AlarmAction::Dismiss:
             AlarmScheduler::AdvanceAfterFire(note->alarm.value());
+            acknowledgeUpToNow();
             break;
         case AlarmAction::Snooze:
             AlarmScheduler::AdvanceAfterSnooze(note->alarm.value(), now);
             break;
         case AlarmAction::OpenNote:
             AlarmScheduler::AdvanceAfterFire(note->alarm.value());
+            acknowledgeUpToNow();
             BringNoteToFront(noteId);
             break;
     }
@@ -1971,10 +2251,9 @@ void Application::ShowTrayBubble() {
                             nullptr, timeBuf, 32)) timeBuf[0] = L'\0';
         std::wstring title = earliestNote->title;
         if (title.empty()) {
-            // Derive from first non-empty line of note text
-            const std::wstring& t = earliestNote->text;
-            size_t end = t.find_first_of(L"\r\n");
-            title = t.substr(0, end);
+            // First line of the note text, capped like the alarm popup title
+            // (an unbounded first line produced a screen-wide bubble).
+            title = FirstLinesOfText(earliestNote->text, 1, 80);
             if (title.empty()) title = Ls(L"tray.bubble.untitled");
         }
         body = Ls(L"tray.bubble.next_alarm") + L" " +

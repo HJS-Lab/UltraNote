@@ -35,7 +35,9 @@ public:
     void        DeleteNotesByIds(const std::vector<uint64_t>& ids);
     void        DeleteSelectedNotes();
     void        MarkDirty();
-    void        SaveAll();
+    // Persist notes.json if dirty. Returns false when the write failed; m_dirty
+    // then stays set so the next autosave tick / shutdown retries.
+    bool        SaveAll();
 
     // Note access
     NoteData*              FindNoteData(uint64_t id);
@@ -109,6 +111,9 @@ public:
     void UnregisterModelessDialog(HWND hwnd);
 
     HINSTANCE GetInstance() const { return m_hInst; }
+    // Hidden top-level app window (tray owner, timer target). Use this instead
+    // of FindWindowW(L"UltraNoteApp", ...) lookups.
+    HWND      GetAppWindow() const { return m_hAppWnd; }
     bool      AreClickableLinksEnabled() const { return m_clickableLinks; }
     COLORREF  GetSearchHighlightColor() const { return m_searchHlColor; }
     HBITMAP   GetMenuBitmap(SHSTOCKICONID id);
@@ -124,7 +129,13 @@ private:
     bool CreateAppWindow();
     bool SetupTrayIcon();
     void RemoveTrayIcon();
-    void ShowTrayMenu();
+    void ShowTrayMenu(int x, int y);   // screen coords of the anchor point
+    // Cascade start position for new notes: SetCascadeOrigin clamps to a
+    // visible monitor, AdvanceCascade steps/resets after each placement.
+    void SetCascadeOrigin(int x, int y);
+    void AdvanceCascade(const SettingsData& settings);
+    // Non-blocking tray notification (NIF_INFO balloon); infoFlags = NIIF_*.
+    void ShowTrayBalloon(const std::wstring& text, DWORD infoFlags);
     void LoadMenuBitmaps();
     // Rebuild the note-list window after a language change (recreated to pick up
     // the new strings). Deferred until any open settings dialog has closed.
@@ -146,6 +157,10 @@ private:
     HINSTANCE       m_hInst     = nullptr;
     HWND            m_hAppWnd   = nullptr;
     NOTIFYICONDATA  m_nid       = {};
+    HICON           m_hTrayIcon = nullptr;   // LoadIconMetric result (owned)
+    bool            m_trayMenuOpen = false;  // TrackPopupMenu modal loop active
+    ULONGLONG       m_trayMenuTick = 0;      // last open: guards double open
+    ULONGLONG       m_trayKeySelectTick = 0; // NIN_KEYSELECT arrives twice for Enter
 
     std::vector<std::unique_ptr<NoteData>>       m_notes;
     std::vector<std::wstring>                    m_folders;
@@ -154,7 +169,13 @@ private:
 
     uint64_t m_nextId       = 1;
     bool     m_dirty        = false;
-    bool     m_notesVisible = true;
+    bool     m_saveFailedNotified = false;   // one balloon per save-failure streak
+    // False until Initialize finished and again during Shutdown: user-driven
+    // messages (tray, hotkeys, timers) are dropped meanwhile - Initialize can
+    // sit in a modal MessageBox while notes.json is retried, and a note created
+    // from the tray then would be freed by the following LoadNotes.
+    bool     m_initialized = false;
+    int      m_trayRetries = 0;              // NIM_ADD retries via IDT_TRAY_RETRY
     bool     m_clickableLinks = true;
     COLORREF m_searchHlColor  = RGB(255, 165, 0);
     bool     m_settingsOpen  = false;

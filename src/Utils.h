@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstdarg>
+#include <cstring>
 #include <ctime>
 
 // RAII scope guard for SelectObject / restore pattern
@@ -146,6 +147,18 @@ inline HBITMAP LoadResourceMenuBitmap(UINT iconId) {
     return hBmp;
 }
 
+// Locale-aware, case-insensitive ordering for user-visible sorting (user
+// locale: "Äpfel" sorts next to "Apfel"). _wcsicmp only folds ASCII under the
+// C locale main.cpp leaves LC_CTYPE in. Returns < 0 / 0 / > 0.
+inline int CompareLocaleNoCase(const std::wstring& a, const std::wstring& b) {
+    int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE,
+                            a.c_str(), static_cast<int>(a.size()),
+                            b.c_str(), static_cast<int>(b.size()),
+                            nullptr, nullptr, 0);
+    if (r == 0) return _wcsicmp(a.c_str(), b.c_str());   // API failure: ordinal fallback
+    return r - CSTR_EQUAL;
+}
+
 // Check if a key press matches a configured shortcut (VK + modifiers)
 inline bool MatchesShortcut(WORD shortcut, WPARAM vk) {
     BYTE scVk = LOBYTE(shortcut);
@@ -215,6 +228,19 @@ inline std::wstring FormatShortcut(WORD hotkey) {
             break;
     }
     return s;
+}
+
+// Escape '&' for menu item text built from USER data (folder names, file
+// paths): a bare '&' would become a mnemonic underline ("Brot & Milch" ->
+// "Brot _Milch"). Not for .lng labels, which use '&' on purpose.
+inline std::wstring EscapeMenuText(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 4);
+    for (wchar_t c : s) {
+        if (c == L'&') out += L"&&";
+        else           out += c;
+    }
+    return out;
 }
 
 // Append "\t<shortcut>" to a menu label if the shortcut is set, otherwise return as-is.
@@ -384,6 +410,85 @@ inline std::vector<UrlSpan> FindUrls(const std::wstring& text) {
     }
 
     return result;
+}
+
+// True if `path` is a readable file that starts with a RIFF/WAVE header.
+// PlaySoundW(SND_FILENAME | SND_ASYNC) returns success for ANY file it can
+// open (the format check happens on the worker thread), so an .mp3 picked as
+// alarm sound played nothing - callers fall back to MessageBeep when this fails.
+inline bool IsWaveFile(const std::wstring& path) {
+    if (path.empty()) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char hdr[12] = {};
+    DWORD got = 0;
+    bool ok = ReadFile(h, hdr, sizeof(hdr), &got, nullptr) && got == sizeof(hdr) &&
+              memcmp(hdr, "RIFF", 4) == 0 && memcmp(hdr + 8, "WAVE", 4) == 0;
+    CloseHandle(h);
+    return ok;
+}
+
+// ---- DPI helpers -----------------------------------------------------------
+// The manifest declares PerMonitorV2, so fonts and non-client areas already
+// scale; hand-laid-out pixel constants (authored at 96 dpi) must be scaled
+// explicitly with these. Both OS entry points are resolved at runtime: no
+// shcore.lib / newer user32 import dependency, fallback 96 dpi.
+
+// Effective DPI of a monitor (GetDpiForMonitor, shcore.dll, Win 8.1+).
+inline UINT MonitorDpi(HMONITOR hMon) {
+    using Fn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    static Fn fn = []() -> Fn {
+        HMODULE h = LoadLibraryW(L"shcore.dll");   // process-lifetime, intentionally not freed
+        return h ? reinterpret_cast<Fn>(GetProcAddress(h, "GetDpiForMonitor")) : nullptr;
+    }();
+    UINT dx = 96, dy = 96;
+    if (fn && hMon && SUCCEEDED(fn(hMon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx > 0) return dx;
+    return 96;
+}
+
+// DPI of the monitor a window is on (GetDpiForWindow, Win 10 1607+); for a null
+// window the primary monitor's DPI.
+inline UINT WindowDpi(HWND hwnd) {
+    using Fn = UINT(WINAPI*)(HWND);
+    static Fn fn = []() -> Fn {
+        HMODULE h = GetModuleHandleW(L"user32.dll");
+        return h ? reinterpret_cast<Fn>(GetProcAddress(h, "GetDpiForWindow")) : nullptr;
+    }();
+    if (hwnd && fn) {
+        UINT d = fn(hwnd);
+        if (d > 0) return d;
+    }
+    POINT origin = { 0, 0 };
+    return MonitorDpi(hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                           : MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY));
+}
+
+// Scale a 96-dpi pixel value to `dpi`.
+inline int DpiScale(int px, UINT dpi) {
+    return MulDiv(px, static_cast<int>(dpi), 96);
+}
+
+// Non-client metrics (message font etc.) for a DPI. SystemParametersInfoForDpi
+// (Win 10 1607+) returns them pre-scaled; older systems get the system-DPI
+// metrics with the font height rescaled from the system DPI to `dpi`.
+inline void GetNonClientMetricsForDpi(NONCLIENTMETRICSW& ncm, UINT dpi) {
+    ncm = {};
+    ncm.cbSize = sizeof(ncm);
+    using Fn = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+    static Fn fn = []() -> Fn {
+        HMODULE h = GetModuleHandleW(L"user32.dll");
+        return h ? reinterpret_cast<Fn>(GetProcAddress(h, "SystemParametersInfoForDpi")) : nullptr;
+    }();
+    if (fn && fn(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi)) return;
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    int sysDpi = 96;
+    if (HDC hdc = GetDC(nullptr)) {
+        sysDpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(nullptr, hdc);
+        if (sysDpi <= 0) sysDpi = 96;
+    }
+    ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, static_cast<int>(dpi), sysDpi);
 }
 
 // Get the directory containing the running EXE

@@ -1,15 +1,20 @@
-## UltraNote v1.8.6 — Portable Sticky Notes for Windows
+## UltraNote v1.8.7 — Portable Sticky Notes for Windows
 
 A modern recreation of ATnotes (2005) built with pure Win32 API and C++17. Lightweight, portable, and dependency-free.
 
-### What's New in v1.8.6
+### What's New in v1.8.7
 
-**New setting — "New notes always on top":**
-- A new checkbox in Settings → General (Display group) makes every newly created note default to always-on-top
-- Off by default, so existing behaviour is unchanged; the option only affects notes created after it is enabled
-- Existing notes keep their individual always-on-top state — the global default never overrides a note you've already pinned or un-pinned
+**Second code-audit remediation — 77 verified fixes for data safety, alarms, focus handling and hygiene:**
+- Data safety: every save now verifies that the bytes really reached the disk, so a full or disconnected drive can no longer replace `notes.json` with an empty file; a failed save keeps retrying and warns via tray balloon; a `notes.json` that exists but is locked (sync client, antivirus) is retried and never overwritten by an empty note set
+- Notes: Alt+F4 hides a note instead of destroying it; the editor no longer truncates text at 30,000 characters; a plain click on a note no longer rewrites the notes file; Alt-shortcuts no longer trigger menu mnemonics or beeps
+- Alarms: "Snooze" works again; a recurring alarm missed during standby or while the app was closed is caught up once; a "Once" alarm with a stale end date fires again; an open alarm popup closes when its note is deleted; only real WAVE files are played
+- Note list: deleting or toggling from the list no longer moves the keyboard focus to another note (the next Del hit the wrong note); the hover preview no longer alters the saved hidden state; selection and scroll position survive refreshes; right-click acts on the folder under the cursor; the maximized state is remembered; umlauts sort correctly
+- Dialogs: Enter works in the find dialog and the alarm windows; the find dialog keeps the keyboard focus; file dialogs accept long paths; shortcut assignment checks for conflicts and a shortcut can be cleared
+- Tray: sharp small icon, keyboard access (Win+B), robust re-add at autostart
+- High-DPI layout for the alarm dialog, alarm popup, find dialog, note list controls and the attachment bar
+- Hygiene: dead code removed, locale-correct yearly alarm description, printer copies respected, print font leak fixed
 
-Built on top of the v1.8.5 code-audit remediation (74 verified fixes); no new dependencies.
+Built on top of v1.8.6; no new dependencies. `notes.json` gains one per-alarm field (`lastFired`); files from older versions load unchanged.
 
 ### Download
 

@@ -107,7 +107,6 @@ notelist.col_alarm_status=Alarm
 notelist.options=&Options
 notelist.preview=&Preview
 notelist.folder_menu=F&older
-notelist.tb_search=Search
 notelist.search_placeholder=Search...
 notelist.status_notes=Notes
 notelist.status_notes_one=Note
@@ -117,6 +116,7 @@ folder.rename=Rename Folder
 folder.delete=Delete Folder
 folder.enter_name=Enter folder name:
 folder.confirm_delete=Delete folder '%s'? Notes will be moved to 'No Folder'.
+folder.exists=A folder named '%s' already exists.
 
 confirm.delete_one=Delete this note?
 confirm.delete_multi=Delete %d notes?
@@ -124,6 +124,10 @@ confirm.delete_multi=Delete %d notes?
 app.already_running=UltraNote is already running.
 error.notes_corrupt=notes.json appears to be damaged. Only some of your notes could be loaded; the original file has been saved as 'notes.json.bak' so nothing is lost.
 hotkey.register_failed=A global hotkey could not be registered (already in use by another program).
+error.notes_unreadable=notes.json exists but could not be read (it may be locked by another program such as a sync client, or access is denied). UltraNote will not start with an empty note list, because the next save would overwrite your notes. Retry once the file is free, or Cancel to quit.
+error.notes_save_failed=Your notes could not be saved (notes.json is locked or the disk is full). UltraNote keeps retrying.
+error.notes_save_failed_exit=Your notes could not be saved (notes.json is locked or the disk is full). Retry, or Cancel to quit and lose the unsaved changes.
+settings.save_failed=The settings could not be saved (settings.json is locked or the disk is full).
 note.empty=(empty)
 note.untitled=(Untitled)
 
@@ -161,6 +165,7 @@ settings.sc_hide=Hide
 settings.sc_global_new=New Note (Global)
 settings.sc_global_list=Note List (Global)
 settings.sc_global_needmod=A global hotkey must include Ctrl or Alt (a key without one — or with Shift only — would hijack that key system-wide).
+settings.sc_conflict=This key combination is already assigned to '%s'.
 
 settings.group_display=Display
 settings.group_delete=Delete

@@ -13,35 +13,57 @@ COLORREF SettingsDialog::s_customColors[16] = {};
 // This is the only Registry use in the whole project; see CLAUDE.md.
 // ----------------------------------------------------------------------------
 namespace {
+    // Full path of the running EXE, grown past MAX_PATH like GetExeDirectory
+    // (a truncated path must never land in the Run key). Empty on failure.
     std::wstring GetSelfExePath() {
-        wchar_t path[MAX_PATH];
-        DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-        // n >= MAX_PATH means the path was truncated; fail closed so we never
-        // write a broken path into the Run key (ApplyAutostartRegistry skips
-        // the write on an empty return).
-        if (n == 0 || n >= MAX_PATH) return std::wstring();
-        return std::wstring(path, n);
+        std::wstring buf(MAX_PATH, L'\0');
+        for (;;) {
+            DWORD n = GetModuleFileNameW(nullptr, &buf[0], static_cast<DWORD>(buf.size()));
+            if (n == 0) return std::wstring();
+            if (n < buf.size()) { buf.resize(n); return buf; }
+            if (buf.size() >= 32768) return std::wstring();
+            buf.resize(buf.size() * 2);
+        }
     }
 
     bool ApplyAutostartRegistry(bool enable) {
         HKEY hKey = nullptr;
         LONG rc = RegOpenKeyExW(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_SET_VALUE, &hKey);
+            0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
         if (rc != ERROR_SUCCESS) return false;
 
         bool ok = true;
+        std::wstring exe = GetSelfExePath();
+        std::wstring quoted = L"\"" + exe + L"\"";
         if (enable) {
-            std::wstring exe = GetSelfExePath();
             if (exe.empty()) { RegCloseKey(hKey); return false; }
-            std::wstring quoted = L"\"" + exe + L"\"";
             DWORD bytes = static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t));
             rc = RegSetValueExW(hKey, L"UltraNote", 0, REG_SZ,
                 reinterpret_cast<const BYTE*>(quoted.c_str()), bytes);
             ok = (rc == ERROR_SUCCESS);
         } else {
-            rc = RegDeleteValueW(hKey, L"UltraNote");
-            ok = (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND);
+            // Only remove OUR entry. Another UltraNote copy (portable stick vs.
+            // installed) may own the Run value; deleting it unconditionally
+            // killed that copy's autostart. Paths compare case-insensitively.
+            wchar_t cur[2048] = {};
+            DWORD cb = sizeof(cur) - sizeof(wchar_t);
+            DWORD type = 0;
+            LONG q = RegQueryValueExW(hKey, L"UltraNote", nullptr, &type,
+                                      reinterpret_cast<BYTE*>(cur), &cb);
+            bool ours = false;
+            if (q == ERROR_SUCCESS && type == REG_SZ) {
+                ours = exe.empty() ||   // can't tell: behave as before (delete)
+                       _wcsicmp(cur, quoted.c_str()) == 0 || _wcsicmp(cur, exe.c_str()) == 0;
+            } else if (q == ERROR_FILE_NOT_FOUND) {
+                ours = false;   // nothing to delete
+            } else {
+                ours = (q != ERROR_MORE_DATA);   // oversized value is certainly not ours
+            }
+            if (ours) {
+                rc = RegDeleteValueW(hKey, L"UltraNote");
+                ok = (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND);
+            }
         }
         RegCloseKey(hKey);
         return ok;
@@ -131,7 +153,7 @@ SettingsData SettingsDialog::LoadFromStorage() {
     return d;
 }
 
-void SettingsDialog::SaveToStorage(const SettingsData& data) {
+bool SettingsDialog::SaveToStorage(const SettingsData& data) {
     auto intS = Storage::LoadSettings();
     auto strS = Storage::LoadSettingsStr();
 
@@ -168,9 +190,12 @@ void SettingsDialog::SaveToStorage(const SettingsData& data) {
         intS[s_shortcutDefs[i].settingsKey] = data.shortcuts[i];
     }
 
-    Storage::SaveAllSettings(intS, strS);
+    bool ok = Storage::SaveAllSettings(intS, strS);
 
-    ApplyAutostartRegistry(data.autostartEnabled);
+    // Only sync the Run key when the settings really persisted; otherwise a
+    // later Cancel would leave registry and settings.json disagreeing.
+    if (ok) ApplyAutostartRegistry(data.autostartEnabled);
+    return ok;
 }
 
 // ============================================================================
@@ -224,7 +249,14 @@ INT_PTR CALLBACK SettingsDialog::DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             switch (LOWORD(wParam)) {
                 case IDC_SETTINGS_OK: {
                     self->ReadFromControls();
-                    SaveToStorage(self->m_data);
+                    if (!SaveToStorage(self->m_data)) {
+                        // Keep the dialog open: ApplySettings re-reads storage and
+                        // would apply the OLD values while the user thinks the
+                        // new ones are active.
+                        MessageBoxW(hwnd, Ls(L"settings.save_failed").c_str(),
+                                    Ls(L"settings.title").c_str(), MB_OK | MB_ICONERROR);
+                        return TRUE;
+                    }
                     Application::Get().ApplySettings();
                     EndDialog(hwnd, IDOK);
                     return TRUE;
@@ -238,7 +270,11 @@ INT_PTR CALLBACK SettingsDialog::DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 case IDC_SETTINGS_APPLY: {
                     self->ReadFromControls();
                     std::wstring oldLang = Localization::Get().GetCurrentLanguage();
-                    SaveToStorage(self->m_data);
+                    if (!SaveToStorage(self->m_data)) {
+                        MessageBoxW(hwnd, Ls(L"settings.save_failed").c_str(),
+                                    Ls(L"settings.title").c_str(), MB_OK | MB_ICONERROR);
+                        return TRUE;
+                    }
                     Application::Get().ApplySettings();
                     // If language changed, rebuild all dialog controls
                     if (Localization::Get().GetCurrentLanguage() != oldLang) {
@@ -1208,7 +1244,11 @@ void SettingsDialog::OnChooseFont(HWND hwnd) {
     cf.lStructSize = sizeof(cf);
     cf.hwndOwner   = hwnd;
     cf.lpLogFont   = &lf;
-    cf.Flags       = CF_INITTOLOGFONTSTRUCT | CF_SCREENFONTS | CF_EFFECTS;
+    // CF_LIMITSIZE: the dialog refuses sizes outside the range Storage clamps
+    // to (6..72 pt), instead of silently storing a different size than chosen.
+    cf.Flags       = CF_INITTOLOGFONTSTRUCT | CF_SCREENFONTS | CF_EFFECTS | CF_LIMITSIZE;
+    cf.nSizeMin    = 6;
+    cf.nSizeMax    = 72;
     cf.rgbColors   = m_data.textColor;
 
     if (ChooseFontW(&cf)) {
@@ -1265,13 +1305,15 @@ void SettingsDialog::OnShortcutChange() {
     if (sel < 0 || sel >= SC_COUNT) return;
 
     WORD hk = static_cast<WORD>(SendMessageW(hHotkey, HKM_GETHOTKEY, 0, 0));
-    if (hk == 0) return;
+    // hk == 0 is a valid assignment: it CLEARS the binding (the only way to
+    // give e.g. Ctrl+Shift+N back to other programs). Registration, matching
+    // and the menu suffix all treat 0 as "unassigned".
 
     // Global hotkeys are registered system-wide via RegisterHotKey. A binding
     // without Ctrl or Alt (e.g. a bare "N", or Shift+N) would swallow that key
-    // for every application and persist across restarts — refuse it. Per-note
+    // for every application and persist across restarts - refuse it. Per-note
     // slots are unaffected (Del with no modifier is a valid per-note default).
-    if (sel == SC_GLOBAL_NEWNOTE || sel == SC_GLOBAL_NOTELIST) {
+    if (hk != 0 && (sel == SC_GLOBAL_NEWNOTE || sel == SC_GLOBAL_NOTELIST)) {
         BYTE mods = HIBYTE(hk);
         if (!(mods & (HOTKEYF_CONTROL | HOTKEYF_ALT))) {
             MessageBoxW(m_hwnd, Ls(L"settings.sc_global_needmod").c_str(),
@@ -1280,10 +1322,28 @@ void SettingsDialog::OnShortcutChange() {
         }
     }
 
+    if (ShortcutConflicts(sel, hk)) return;
+
     m_data.shortcuts[sel] = hk;
 
     std::wstring keyStr = FormatShortcut(hk);
     ListView_SetItemText(hList, sel, 1, const_cast<wchar_t*>(keyStr.c_str()));
+}
+
+bool SettingsDialog::ShortcutConflicts(int sel, WORD hk) const {
+    // One combo, one action: the same key in two slots would do different
+    // things depending on which window has the focus (e.g. Alt+H deleting in
+    // display mode but hiding in edit mode). 0 = "unassigned" never conflicts.
+    if (hk == 0) return false;
+    for (int i = 0; i < SC_COUNT; ++i) {
+        if (i != sel && m_data.shortcuts[i] == hk) {
+            MessageBoxW(m_hwnd,
+                        FormatStr(Ls(L"settings.sc_conflict"), Ls(s_shortcutDefs[i].locKey)).c_str(),
+                        Ls(L"settings.title").c_str(), MB_OK | MB_ICONWARNING);
+            return true;
+        }
+    }
+    return false;
 }
 
 void SettingsDialog::OnShortcutDefault() {
@@ -1295,6 +1355,7 @@ void SettingsDialog::OnShortcutDefault() {
     if (sel < 0 || sel >= SC_COUNT) return;
 
     WORD defHk = s_shortcutDefs[sel].defaultHotkey;
+    if (ShortcutConflicts(sel, defHk)) return;   // default may clash with a user binding
     m_data.shortcuts[sel] = defHk;
     SendMessageW(hHotkey, HKM_SETHOTKEY, defHk, 0);
 
@@ -1546,6 +1607,6 @@ void SettingsDialog::RebuildControls() {
     OnInitDialog(m_hwnd);
 
     // Restore the tab the user was on (savedTab, captured before OnInitDialog)
-    TabCtrl_SetCurSel(m_hTab, savedTab);
+    if (m_hTab) TabCtrl_SetCurSel(m_hTab, savedTab);
     ShowTab(savedTab);
 }

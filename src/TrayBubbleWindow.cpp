@@ -1,4 +1,5 @@
 #include "TrayBubbleWindow.h"
+#include "Utils.h"
 #include <algorithm>
 #include <vector>
 
@@ -22,22 +23,7 @@ namespace {
     constexpr int kPxHeaderGap   = 4;    // Extra space under header line
     constexpr int kPxMaxContentW = 320;  // Maximum text width before wrapping
     constexpr int kPxGap         = 6;    // Gap between bubble and tray icon
-
-    // Effective DPI of a monitor via GetDpiForMonitor (shcore.dll, Win8.1+) loaded
-    // through GetProcAddress so we don't add a shcore.lib link dependency. Returns
-    // 96 on older systems / failure.
-    UINT MonitorDpi(HMONITOR hMon) {
-        using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
-        static GetDpiForMonitorFn fn = []() -> GetDpiForMonitorFn {
-            HMODULE h = LoadLibraryW(L"shcore.dll");   // process-lifetime, intentionally not freed
-            return h ? reinterpret_cast<GetDpiForMonitorFn>(
-                           GetProcAddress(h, "GetDpiForMonitor")) : nullptr;
-        }();
-        if (!fn) return 96;
-        UINT dx = 96, dy = 96;
-        if (SUCCEEDED(fn(hMon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx > 0) return dx;
-        return 96;
-    }
+    // (DPI lookups: MonitorDpi / GetNonClientMetricsForDpi in Utils.h)
 }
 
 bool TrayBubbleWindow::Create(HINSTANCE hInst) {
@@ -81,22 +67,8 @@ void TrayBubbleWindow::EnsureFontsForDpi(UINT dpi) {
     if (m_hFontRegular && m_hFontBold && dpi == m_dpi) return;  // already current
     m_dpi = dpi;
 
-    NONCLIENTMETRICSW ncm = { sizeof(ncm) };
-    bool scaled = false;
-    // GetProcAddress keeps the link clean (user32 is always loaded) and degrades
-    // gracefully on pre-1607 builds where the symbol is absent.
-    using SPIFD = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
-    if (HMODULE hUser = GetModuleHandleW(L"user32.dll")) {
-        if (auto pSPIFD = reinterpret_cast<SPIFD>(
-                GetProcAddress(hUser, "SystemParametersInfoForDpi"))) {
-            scaled = pSPIFD(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi) != FALSE;
-        }
-    }
-    if (!scaled) {
-        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-        // 96-dpi metrics: scale the font height to the target DPI ourselves.
-        ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, dpi, 96);
-    }
+    NONCLIENTMETRICSW ncm;
+    GetNonClientMetricsForDpi(ncm, dpi);   // SystemParametersInfoForDpi or scaled fallback
 
     LOGFONTW lfRegular = ncm.lfMessageFont;
     LOGFONTW lfBold    = ncm.lfMessageFont;
@@ -359,9 +331,15 @@ void TrayBubbleWindow::Show(const RECT& trayIconRect,
     int bubbleW = content.cx + 2 * kPadX;
     int bubbleH = content.cy + 2 * kPadY;
 
-    // Pick tail side from the taskbar edge (compare icon rect with work area).
+    // Pick tail side from the taskbar edge (compare icon rect with the work
+    // area of the ICON's monitor - SPI_GETWORKAREA is the primary monitor only,
+    // which put the bubble far away from a taskbar on a secondary screen).
     RECT wa = {};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(MonitorFromRect(&trayIconRect, MONITOR_DEFAULTTONEAREST), &mi))
+        wa = mi.rcWork;
+    else
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     int iconCX = (trayIconRect.left + trayIconRect.right)  / 2;
     int iconCY = (trayIconRect.top  + trayIconRect.bottom) / 2;
 

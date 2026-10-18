@@ -11,11 +11,16 @@ class Storage {
 public:
     // Load all notes from notes.json; returns empty vector if file missing.
     // outCorrupt is set to true when notes.json existed but failed to parse
-    // fully — in that case LoadNotes has already written a notes.json.bak backup
+    // fully - in that case LoadNotes has already written a notes.json.bak backup
     // of the raw file before any save can overwrite it with the partial set.
+    // outUnreadable is set to true when notes.json EXISTS but could not be
+    // opened/read (sharing violation, ACL, I/O error): the returned vector is
+    // empty, but the caller must NOT treat that as an empty store (a save would
+    // overwrite the real file). A missing file is a normal first start.
     static std::vector<std::unique_ptr<NoteData>> LoadNotes(uint64_t& outNextId,
                                                               std::vector<std::wstring>& outFolders,
-                                                              bool& outCorrupt);
+                                                              bool& outCorrupt,
+                                                              bool& outUnreadable);
 
     // Save all notes to notes.json (atomic: write .tmp then rename)
     static bool SaveNotes(const std::vector<std::unique_ptr<NoteData>>& notes, uint64_t nextId,
@@ -30,10 +35,13 @@ public:
                             const std::vector<const NoteData*>& notes);
 
     // Import notes from a .unote file. On success outNotes is filled with the
-    // parsed notes (with their original IDs from the file — caller is expected
+    // parsed notes (with their original IDs from the file - caller is expected
     // to reassign fresh IDs before inserting them into the live store).
+    // outUnreadable distinguishes "file could not be opened/read" from "file
+    // is not a valid export" so the caller can show the right error.
     static bool ImportNotes(const std::wstring& path,
-                            std::vector<std::unique_ptr<NoteData>>& outNotes);
+                            std::vector<std::unique_ptr<NoteData>>& outNotes,
+                            bool& outUnreadable);
 
     // Key-value settings (settings.json)
     // Supports int and string values in the same file

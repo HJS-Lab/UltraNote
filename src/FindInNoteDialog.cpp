@@ -2,6 +2,7 @@
 #include "NoteWindow.h"
 #include "Application.h"
 #include "Localization.h"
+#include "Utils.h"
 #include <windowsx.h>
 #include <string>
 
@@ -50,15 +51,20 @@ FindInNoteDialog::~FindInNoteDialog() {
         DestroyWindow(m_hwnd);
         m_hwnd = nullptr;
     }
+    if (m_hFont) { DeleteObject(m_hFont); m_hFont = nullptr; }
 }
 
 bool FindInNoteDialog::Create() {
     if (!EnsureClassRegistered(m_hInst)) return false;
 
+    // Lay the dialog out for the owner note's monitor DPI (W_* are 96-dpi values)
+    HWND ownerHwnd = m_owner ? m_owner->GetHwnd() : nullptr;
+    m_dpi = WindowDpi(ownerHwnd);
+
     // Compute total client size from layout (two checkboxes: case, whole-word)
-    int clientH = W_MARGIN + W_LABEL_H + 2 + W_EDIT_H + W_GAP + W_CHECK_H
-                  + 2 + W_CHECK_H + W_GAP + W_BTN_H + W_MARGIN;
-    int clientW = W_MARGIN + W_CLIENT_W + W_MARGIN;
+    int clientH = DpiScale(W_MARGIN + W_LABEL_H + 2 + W_EDIT_H + W_GAP + W_CHECK_H
+                           + 2 + W_CHECK_H + W_GAP + W_BTN_H + W_MARGIN, m_dpi);
+    int clientW = DpiScale(W_MARGIN + W_CLIENT_W + W_MARGIN, m_dpi);
 
     DWORD style   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = WS_EX_TOOLWINDOW;
@@ -66,7 +72,6 @@ bool FindInNoteDialog::Create() {
     RECT rc = { 0, 0, clientW, clientH };
     AdjustWindowRectEx(&rc, style, FALSE, exStyle);
 
-    HWND ownerHwnd = m_owner ? m_owner->GetHwnd() : nullptr;
     m_hwnd = CreateWindowExW(
         exStyle, kClassName, Ls(L"note.find_title").c_str(),
         style,
@@ -95,7 +100,8 @@ void FindInNoteDialog::UpdatePosition() {
 
     RECT ownerRc;
     GetWindowRect(ownerHwnd, &ownerRc);
-    int x = ownerRc.right + 8;
+    const int gap = DpiScale(8, m_dpi);
+    int x = ownerRc.right + gap;
     int y = ownerRc.top;
 
     // Clamp to the owner's monitor work area so the dialog never lands
@@ -104,7 +110,7 @@ void FindInNoteDialog::UpdatePosition() {
     HMONITOR hMon = MonitorFromWindow(ownerHwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
     if (GetMonitorInfoW(hMon, &mi)) {
-        if (x + winW > mi.rcWork.right)  x = ownerRc.left - winW - 8;
+        if (x + winW > mi.rcWork.right)  x = ownerRc.left - winW - gap;
         if (x < mi.rcWork.left)          x = mi.rcWork.left;
         if (y + winH > mi.rcWork.bottom) y = mi.rcWork.bottom - winH;
         if (y < mi.rcWork.top)           y = mi.rcWork.top;
@@ -129,7 +135,13 @@ void FindInNoteDialog::ShowAndFocus() {
 }
 
 void FindInNoteDialog::CreateControls() {
-    HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    // Message font scaled for the dialog's DPI (DEFAULT_GUI_FONT is a fixed
+    // 96-dpi stock font and stayed tiny on high-DPI monitors).
+    NONCLIENTMETRICSW ncm;
+    GetNonClientMetricsForDpi(ncm, m_dpi);
+    if (m_hFont) DeleteObject(m_hFont);
+    m_hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+    HFONT hFont = m_hFont ? m_hFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
     m_hLabel = CreateWindowExW(0, L"STATIC",
         Ls(L"note.find_label").c_str(),
@@ -172,26 +184,27 @@ void FindInNoteDialog::CreateControls() {
 }
 
 void FindInNoteDialog::LayoutControls() {
+    auto S = [this](int v) { return DpiScale(v, m_dpi); };   // 96-dpi -> m_dpi
     int y = W_MARGIN;
-    SetWindowPos(m_hLabel, nullptr, W_MARGIN, y, W_CLIENT_W, W_LABEL_H,
+    SetWindowPos(m_hLabel, nullptr, S(W_MARGIN), S(y), S(W_CLIENT_W), S(W_LABEL_H),
                  SWP_NOZORDER);
     y += W_LABEL_H + 2;
-    SetWindowPos(m_hEdit, nullptr, W_MARGIN, y, W_CLIENT_W, W_EDIT_H,
+    SetWindowPos(m_hEdit, nullptr, S(W_MARGIN), S(y), S(W_CLIENT_W), S(W_EDIT_H),
                  SWP_NOZORDER);
     y += W_EDIT_H + W_GAP;
-    SetWindowPos(m_hCase, nullptr, W_MARGIN, y, W_CLIENT_W, W_CHECK_H,
+    SetWindowPos(m_hCase, nullptr, S(W_MARGIN), S(y), S(W_CLIENT_W), S(W_CHECK_H),
                  SWP_NOZORDER);
     y += W_CHECK_H + 2;
-    SetWindowPos(m_hWhole, nullptr, W_MARGIN, y, W_CLIENT_W, W_CHECK_H,
+    SetWindowPos(m_hWhole, nullptr, S(W_MARGIN), S(y), S(W_CLIENT_W), S(W_CHECK_H),
                  SWP_NOZORDER);
     y += W_CHECK_H + W_GAP;
 
     int totalW = W_MARGIN + W_CLIENT_W + W_MARGIN;
     int rightEdge = totalW - W_MARGIN;
-    SetWindowPos(m_hCloseBtn, nullptr, rightEdge - W_BTN_W, y, W_BTN_W, W_BTN_H,
+    SetWindowPos(m_hCloseBtn, nullptr, S(rightEdge - W_BTN_W), S(y), S(W_BTN_W), S(W_BTN_H),
                  SWP_NOZORDER);
-    SetWindowPos(m_hFindBtn, nullptr, rightEdge - 2 * W_BTN_W - W_GAP, y,
-                 W_BTN_W, W_BTN_H, SWP_NOZORDER);
+    SetWindowPos(m_hFindBtn, nullptr, S(rightEdge - 2 * W_BTN_W - W_GAP), S(y),
+                 S(W_BTN_W), S(W_BTN_H), SWP_NOZORDER);
 }
 
 void FindInNoteDialog::OnFindNext() {
@@ -232,10 +245,17 @@ LRESULT FindInNoteDialog::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) 
         int code = HIWORD(wParam);
         if (id == ID_FIND && code == BN_CLICKED)  { OnFindNext();   return 0; }
         if (id == ID_CLOSE && code == BN_CLICKED) { ShowWindow(m_hwnd, SW_HIDE); return 0; }
-        // IDCANCEL: Esc, delivered by IsDialogMessageW (no button owns that id).
+        // IDOK/IDCANCEL: Enter/Esc delivered by IsDialogMessageW (no button
+        // owns these ids; IDOK only arrives if DM_GETDEFID were unanswered).
+        if (id == IDOK)     { OnFindNext(); return 0; }
         if (id == IDCANCEL) { ShowWindow(m_hwnd, SW_HIDE); return 0; }
         break;
     }
+
+    case DM_GETDEFID:
+        // Not a real dialog (no DialogBox proc): without this answer
+        // IsDialogMessageW gets 0 and Enter in the search box did nothing.
+        return MAKELRESULT(ID_FIND, DC_HASDEFID);
 
     case WM_CLOSE:
         ShowWindow(m_hwnd, SW_HIDE);

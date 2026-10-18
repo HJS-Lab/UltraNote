@@ -66,6 +66,11 @@ struct AlarmConfig {
     int        firedCount = 0;
     int64_t    snoozeUntil = 0;     // 0 = not snoozed; else naive-local seconds since epoch
                                     // (local wall-clock treated as UTC; see AlarmScheduler::SysTimeToNaiveSec)
+    // Naive-local seconds of the last occurrence that actually fired (0 = never
+    // / schedule just (re)configured). Lets CheckDueAlarms catch up a recurring
+    // occurrence missed while the app was not running or the PC was asleep
+    // (see AlarmScheduler::ComputeMissedOccurrence). Persisted in notes.json.
+    int64_t    lastFiredSec = 0;
     bool       paused = false;
 };
 

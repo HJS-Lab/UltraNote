@@ -185,13 +185,23 @@ std::optional<SYSTEMTIME> AlarmScheduler::ComputeNextFireTime(const AlarmConfig&
         return std::nullopt;
     }
 
-    // Snooze: if active and still in future, the snooze time IS the next fire
+    // Snooze: once set, the snooze time IS the next fire - also when it already
+    // lies in the past (the 30 s timer or a sleeping PC overshoots it); the
+    // fire path clears it via AdvanceAfterFire. Falling back to the normal
+    // schedule here meant Daily jumped to tomorrow and Once was blocked by the
+    // same-minute throttle, so "Snooze" effectively never fired.
     if (alarm.snoozeUntil > 0) {
-        int64_t nowSec = SysTimeToNaiveSec(now);
-        if (alarm.snoozeUntil > nowSec) {
-            return NaiveSecToSysTime(alarm.snoozeUntil);
-        }
-        // Snooze expired — fall through and compute normal next fire.
+        return NaiveSecToSysTime(alarm.snoozeUntil);
+    }
+
+    // A garbage startTime (hand-edited file) cannot be advanced by AddDays
+    // (SystemTimeToFileTime fails and it returns its input unchanged), so the
+    // Daily/Weekly loops below would never terminate. Storage pauses such
+    // alarms; this guard makes the scheduler safe regardless of the caller.
+    {
+        FILETIME ftChk;
+        SYSTEMTIME stChk = alarm.startTime;
+        if (!SystemTimeToFileTime(&stChk, &ftChk)) return std::nullopt;
     }
 
     // Fire contract: return the earliest valid occurrence >= the current MINUTE
@@ -215,8 +225,11 @@ std::optional<SYSTEMTIME> AlarmScheduler::ComputeNextFireTime(const AlarmConfig&
         candidate.wHour   = alarm.startTime.wHour;
         candidate.wMinute = alarm.startTime.wMinute;
         candidate.wSecond = 0;
-        while (CompareSysTime(candidate, nowFloor) < 0 ||
-               CompareSysTime(candidate, alarm.startTime) < 0) {
+        // Bounded (at most one step is ever needed): a loop that depends on
+        // AddDays making progress must not be able to spin forever.
+        for (int guard = 0; guard < 3 &&
+                            (CompareSysTime(candidate, nowFloor) < 0 ||
+                             CompareSysTime(candidate, alarm.startTime) < 0); ++guard) {
             candidate = AddDays(candidate, 1);
         }
         break;
@@ -371,6 +384,30 @@ std::optional<SYSTEMTIME> AlarmScheduler::ComputeNextFireTime(const AlarmConfig&
     return candidate;
 }
 
+std::optional<SYSTEMTIME> AlarmScheduler::ComputeMissedOccurrence(const AlarmConfig& alarm,
+                                                                  const SYSTEMTIME& now) {
+    if (alarm.paused || alarm.snoozeUntil > 0 || alarm.lastFiredSec <= 0) return std::nullopt;
+    // Once needs no catch-up: ComputeNextFireTime returns its startTime even
+    // when that is in the past, so the normal fire path already handles it.
+    if (alarm.kind == AlarmKind::Once) return std::nullopt;
+    if (SysTimeToNaiveSec(now) <= alarm.lastFiredSec) return std::nullopt;
+
+    // First occurrence strictly after the last fired minute ...
+    SYSTEMTIME from = NaiveSecToSysTime(alarm.lastFiredSec + 60);
+    auto occ = ComputeNextFireTime(alarm, from);
+    if (!occ.has_value() || CompareSysTime(*occ, now) > 0) return std::nullopt;
+
+    // ... then walk forward to the LAST one that is still <= now. Bounded: a
+    // daily alarm after a very long absence would otherwise step day by day.
+    for (int i = 0; i < 5000; ++i) {
+        SYSTEMTIME next = NaiveSecToSysTime(SysTimeToNaiveSec(*occ) + 60);
+        auto later = ComputeNextFireTime(alarm, next);
+        if (!later.has_value() || CompareSysTime(*later, now) > 0) break;
+        occ = later;
+    }
+    return occ;
+}
+
 std::wstring AlarmScheduler::DescribeInterval(const AlarmConfig& alarm) {
     switch (alarm.kind) {
     case AlarmKind::Once:
@@ -401,8 +438,15 @@ std::wstring AlarmScheduler::DescribeInterval(const AlarmConfig& alarm) {
         return FormatInt(Ls(L"alarm.desc.quarterly"), (std::clamp)(alarm.quarterDay, 1, 90));
 
     case AlarmKind::Yearly: {
-        wchar_t buf[16];
-        swprintf_s(buf, L"%02u.%02u.", alarm.startTime.wDay, alarm.startTime.wMonth);
+        // Locale month/day pattern (LOCALE_SMONTHDAY: "d. MMMM" / "MMMM d")
+        // instead of a hardcoded "DD.MM." that read German in every language.
+        wchar_t pattern[80] = {};
+        if (!GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SMONTHDAY, pattern, 80))
+            wcscpy_s(pattern, L"MMM d");
+        wchar_t buf[96] = {};
+        SYSTEMTIME st = alarm.startTime;
+        if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, pattern, buf, 96, nullptr))
+            swprintf_s(buf, L"%02u.%02u.", st.wDay, st.wMonth);   // invalid date: raw
         return FormatStr(Ls(L"alarm.desc.yearly"), buf);
     }
     }

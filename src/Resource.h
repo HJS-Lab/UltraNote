@@ -1,7 +1,7 @@
 #pragma once
 
 // Version
-#define ULTRANOTE_VERSION       L"v1.8.6"
+#define ULTRANOTE_VERSION       L"v1.8.7"
 
 // Icons
 #define IDI_APP                 101
@@ -189,6 +189,8 @@
 #define ALARM_CHECK_INTERVAL_MS 30000
 #define IDT_HEADER_DRAG         4
 #define HEADER_DRAG_POLL_MS     25
+#define IDT_TRAY_RETRY          5
+#define TRAY_RETRY_MS           3000
 
 // Alarm popup window control IDs (700-720 for popup; 720-770 for config dialog)
 #define IDC_ALARM_DISMISS       701

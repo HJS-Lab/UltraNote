@@ -20,7 +20,7 @@ A modern recreation of **ATnotes** (the classic sticky notes app from 2005) buil
 
 > **Portable:** Single EXE, no installation needed. All data (notes, settings) stored next to the executable.
 
-Download the latest version from [GitHub Releases](https://github.com/HJS-Lab/UltraNote/releases) or [GitLab Releases](https://gitlab.com/HJS-cpu/ultranote/-/releases).
+Download the latest version from [GitHub Releases](https://github.com/HJS-Lab/UltraNote/releases) or [GitLab Releases](https://gitlab.com/HJS-Lab/ultranote/-/releases).
 
 ---
 
@@ -96,7 +96,7 @@ The executable and language files will be in `build/Release/`.
 
 ### CI/CD
 
-Every push to `master` triggers automatic builds on both GitHub Actions and GitLab CI. Tagged commits (`v*`) create releases with portable ZIP downloads on both platforms.
+Every push to `main` triggers automatic builds on both GitHub Actions and GitLab CI. Tagged commits (`v*`) create releases with portable ZIP downloads on both platforms.
 
 ---
 
@@ -108,6 +108,16 @@ Every push to `master` triggers automatic builds on both GitHub Actions and GitL
 ---
 
 ## Changelog
+
+### v1.8.7 (2026-10-17)
+- **Second full code-audit remediation:** 77 verified findings fixed across data safety, alarms, focus handling, the note list, printing, HiDPI, and code hygiene — no new features, no new dependencies
+- **Data safety:** every save verifies that the data really reached the disk (a full or disconnected drive no longer replaces `notes.json` with an empty file); a failed save keeps retrying and warns via tray balloon instead of silently dropping changes at exit; a locked `notes.json` (sync client, antivirus) is retried and never overwritten by an empty note set; invalid or duplicate note IDs get fresh IDs instead of being dropped
+- **Notes:** Alt+F4 hides a note instead of destroying it (and an external close request now exits the app cleanly); the editor no longer truncates text at 30,000 characters; a plain click on a note no longer rewrites the notes file; Alt-shortcuts no longer trigger menu mnemonics or beeps; attachments open once per click; umlauts are found by the in-note search and highlight
+- **Alarms:** "Snooze" works again; a recurring alarm missed during standby or while the app was closed is caught up once (new per-alarm `lastFired` field, older files load unchanged); a "Once" alarm with a stale end condition fires again; editing only the sound no longer re-arms a fired alarm; an open popup closes when its note is deleted; only real WAVE files are played, with a beep fallback
+- **Note list:** deleting or toggling from the list no longer activates another note (the next Del hit the wrong note); the hover preview is purely visual and no longer changes the saved hidden state; selection, focus and scroll position survive refreshes; the folder context menu acts on the folder under the cursor and is keyboard-accessible; the maximized state is remembered; folder and column sorting is locale-aware; the attachment column is sortable; folder names are checked for collisions
+- **Dialogs & keyboard:** Enter works in the find dialog, the alarm popup and the alarm dialog; the find dialog keeps the keyboard focus after each match; file dialogs accept long paths; shortcut assignment refuses conflicts and a shortcut can be cleared; global hotkeys without Ctrl/Alt from old settings files are no longer registered; the autostart entry of another UltraNote copy is left alone
+- **Tray & printing:** sharp small tray icon, keyboard access (Win+B), retry when the taskbar is not ready yet, multi-monitor hover bubble; printing respects the copies count, no longer leaks a font per job, and cannot loop forever on tiny page formats
+- **HiDPI:** alarm dialog, alarm popup, find dialog, note-list search field, rename dialog and the attachment bar scale with the monitor DPI
 
 ### v1.8.6 (2026-06-25)
 - **New setting "New notes always on top":** a checkbox in Settings → General (Display group) makes newly created notes default to always-on-top; off by default, applies only to notes created after it is enabled, and never overrides the individual always-on-top state of existing notes

@@ -95,6 +95,9 @@ void Localization::LoadDefaults() {
 
     m_strings[L"app.already_running"] = L"UltraNote is already running.";
     m_strings[L"error.notes_corrupt"] = L"notes.json appears to be damaged. Only some of your notes could be loaded; the original file has been saved as 'notes.json.bak' so nothing is lost.";
+    m_strings[L"error.notes_unreadable"] = L"notes.json exists but could not be read (locked by another program, or access denied). UltraNote will not start with an empty note list because the next save would overwrite your notes. Retry once the file is free, or Cancel to quit.";
+    m_strings[L"error.notes_save_failed"] = L"Your notes could not be saved (notes.json is locked or the disk is full). UltraNote keeps retrying.";
+    m_strings[L"error.notes_save_failed_exit"] = L"Your notes could not be saved (notes.json is locked or the disk is full). Retry, or Cancel to quit and lose the unsaved changes.";
     m_strings[L"note.empty"]          = L"(empty)";
 }
 
@@ -186,18 +189,7 @@ bool Localization::ParseLngFile(const std::wstring& path) {
         if (key.empty()) continue;
 
         // Convert key and value from UTF-8 to wide string
-        auto toWide = [](const std::string& s) -> std::wstring {
-            if (s.empty()) return L"";
-            int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
-                                          static_cast<int>(s.size()), nullptr, 0);
-            if (len <= 0) return L"";
-            std::wstring result(static_cast<size_t>(len), L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
-                                static_cast<int>(s.size()), &result[0], len);
-            return result;
-        };
-
-        m_strings[toWide(key)] = toWide(value);
+        m_strings[Utf8ToWide(key)] = Utf8ToWide(value);
         ++parsedCount;
     }
 

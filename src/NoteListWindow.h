@@ -31,6 +31,9 @@ public:
     void SetPreviewEnabled(bool enabled);
     void SetPreviewPaused(bool paused);
     void FocusSearchField();
+    // Persist window geometry/columns now (session end: Hide()/destructor
+    // never run when Windows logs off with the list open).
+    void PersistLayout() { SaveSettings(); }
 
     // Simple input dialog helper (also used by NoteWindow for "Rename note"
     // so the two rename flows share pixel-identical look & feel).
@@ -47,6 +50,9 @@ private:
     void SetupColumns();
     void PopulateList(const wchar_t* dateFmt = nullptr);
     void PopulateFolderList();
+    // Apply the folder list's current selection as filter (LBN_SELCHANGE and
+    // programmatic selection, e.g. right-click on an unselected folder).
+    void OnFolderSelectionChanged();
     void ResizeControls();
 
     void LoadSettings();
@@ -74,7 +80,6 @@ private:
     void DeleteSelectedNotes();
     void RenameSelectedNote();
     void OpenAlarmForSelected();
-    void ShowSetFolderMenu();
     void HandleExport();
     void HandlePrint();
     void ToggleNoteHidden(uint64_t noteId);
@@ -84,8 +89,9 @@ private:
     // refresh once. ToggleNoteAlwaysOnTop wraps this for the single-note case.
     void ApplyAlwaysOnTopToggle(uint64_t noteId);
 
-    // Folder context menu
-    void ShowFolderContextMenu(int screenX, int screenY);
+    // Folder context menu (onItem = false: right-click into the empty area,
+    // only "New folder" is offered)
+    void ShowFolderContextMenu(int screenX, int screenY, bool onItem);
     void NewFolderDialog();
     void RenameFolderDialog(const std::wstring& oldName);
     void DeleteFolderConfirm(const std::wstring& name);
@@ -110,7 +116,7 @@ private:
         UINT_PTR subId, DWORD_PTR refData);
 
     // Header drag-drop feedback (ATnotes-style red insertion arrows)
-    void OnHeaderBeginDrag(int sourceIdx);
+    void OnHeaderBeginDrag();
     void OnHeaderEndDrag();
     void UpdateHeaderDragOverlay();
 
@@ -126,7 +132,8 @@ private:
     HICON      m_hAllNotesIcon  = nullptr;
     HICON      m_hSearchIcon    = nullptr;
     HFONT      m_hSearchFont    = nullptr;
-    HFONT      m_hSymbolFont    = nullptr;   // cached 20px symbol font (custom-draw)
+    HFONT      m_hSymbolFont    = nullptr;   // cached symbol font (custom-draw), 20 px at 96 dpi
+    UINT       m_symbolFontDpi  = 0;         // DPI m_hSymbolFont was made for
     HFONT      m_hAllNotesFont  = nullptr;   // cached bold font for the "All Notes" folder row
     HICON      m_hAttachIcon    = nullptr;   // cached attachment icon (custom-draw)
     HICON      m_hWndIconSmall  = nullptr;   // title-bar icon (WM_SETICON, owned)
@@ -142,6 +149,9 @@ private:
 
     enum Column { COL_TITLE = 0, COL_TEXT, COL_FOLDER, COL_HIDDEN, COL_ONTOP, COL_CREATED, COL_ATTACH,
                   COL_NEXT_ALARM, COL_INTERVAL, COL_ALARM_STATUS, COL_COUNT };
+    // Default column widths (px), single source for SetupColumns and the
+    // re-show fallback in SetColumnVisible.
+    static const int kDefaultColWidths[COL_COUNT];
 
     // Header context menu: toggle per-column visibility
     void ShowHeaderContextMenu(int screenX, int screenY);
@@ -152,6 +162,10 @@ private:
     // so we can restore them on re-show without losing the user's preferred width.
     bool     m_columnVisible[COL_COUNT] = {};
     int      m_columnSavedWidths[COL_COUNT] = {};
+
+    // Saved "maximized" flag, applied on the first Show() (the window is
+    // created hidden, so it cannot be applied in LoadSettings).
+    bool m_showMaximized     = false;
 
     // Splitter between folder list and listview
     int  m_folderListWidth   = 150;
@@ -183,11 +197,14 @@ private:
 
     // Header click tracking (to ignore spurious WM_LBUTTONUP without prior WM_LBUTTONDOWN)
     bool     m_headerMouseDown    = false;
+    // Set when ListViewSubclassProc consumed an Alt+<key> shortcut: the
+    // WM_SYSCHAR TranslateMessage derives from it is swallowed, otherwise
+    // DefWindowProc runs the menu-bar mnemonic search (Alt+O opened "&Options").
+    bool     m_swallowNextSysChar = false;
 
     // Header drag-drop state
     std::unique_ptr<HeaderDragOverlay> m_headerDragOverlay;
     bool     m_headerDragging     = false;
-    int      m_headerDragSource   = -1;
 
     // Cached display settings (refreshed on Refresh/settings change)
     bool     m_zebraStriping      = false;
@@ -199,13 +216,13 @@ private:
 
     // Preview state
     bool     m_previewEnabled     = false;
+    bool     m_previewPaused      = false;   // settings dialog open: no hover polling
     int      m_previewDelay       = 400;   // hover delay ms (cached; read per tick)
-    int      m_previewNoteIdx     = -1;
     uint64_t m_previewNoteId      = 0;
     bool     m_previewWasHidden   = false;
     bool     m_previewTimerActive = false;
     int      m_previewPendingIdx  = -1;
-    DWORD    m_previewHoverStart  = 0;
+    ULONGLONG m_previewHoverStart = 0;   // GetTickCount64 (no 49-day wrap)
     int      m_previewOrigX       = 0;
     int      m_previewOrigY       = 0;
 

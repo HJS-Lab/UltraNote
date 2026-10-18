@@ -1,4 +1,5 @@
 #include "HeaderDragOverlay.h"
+#include "Utils.h"
 
 namespace {
     const wchar_t kClassName[] = L"UltraNoteHeaderDragOverlay";
@@ -7,22 +8,10 @@ namespace {
     // Premultiplied BGRA, opaque red
     constexpr BYTE kB = 0, kG = 0, kR = 210, kA = 255;
 
-    // GetDpiForMonitor (shcore.dll, Win8.1+) via GetProcAddress so we don't add a
-    // shcore.lib link dependency. Returns the effective DPI at a screen point, or
-    // 96 on older systems / failure.
+    // Effective DPI at a screen point (MonitorDpi in Utils.h; 96 on failure).
     UINT DpiAtPoint(int xScreen, int yScreen) {
-        using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
-        static GetDpiForMonitorFn fn = []() -> GetDpiForMonitorFn {
-            HMODULE h = LoadLibraryW(L"shcore.dll");   // process-lifetime, intentionally not freed
-            return h ? reinterpret_cast<GetDpiForMonitorFn>(
-                           GetProcAddress(h, "GetDpiForMonitor")) : nullptr;
-        }();
-        if (!fn) return 96;
         POINT pt = { xScreen, yScreen };
-        HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        UINT dx = 96, dy = 96;
-        if (SUCCEEDED(fn(hMon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx > 0) return dx;
-        return 96;
+        return MonitorDpi(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
     }
 }
 
@@ -80,6 +69,11 @@ void HeaderDragOverlay::PaintArrow(HWND hwnd, bool pointingDown) {
 
     void* pBits = nullptr;
     HBITMAP hBmp = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (!hBmp || !pBits) {   // GDI exhaustion: skip the marker rather than write to null
+        DeleteDC(hdcMem);
+        ReleaseDC(nullptr, hdcScreen);
+        return;
+    }
     HBITMAP hOldBmp = static_cast<HBITMAP>(SelectObject(hdcMem, hBmp));
 
     BYTE* px = static_cast<BYTE*>(pBits);
@@ -129,6 +123,11 @@ void HeaderDragOverlay::PaintStripe(HWND hwnd, int height) {
 
     void* pBits = nullptr;
     HBITMAP hBmp = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (!hBmp || !pBits) {   // see PaintArrow
+        DeleteDC(hdcMem);
+        ReleaseDC(nullptr, hdcScreen);
+        return;
+    }
     HBITMAP hOldBmp = static_cast<HBITMAP>(SelectObject(hdcMem, hBmp));
 
     BYTE* px = static_cast<BYTE*>(pBits);

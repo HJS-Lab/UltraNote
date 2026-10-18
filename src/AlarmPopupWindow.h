@@ -19,7 +19,7 @@ public:
     AlarmPopupWindow(HINSTANCE hInst, uint64_t noteId,
                      const std::wstring& title, const std::wstring& text,
                      bool playSound, const std::wstring& soundFile,
-                     int snoozeMinutes, int stackIndex);
+                     int stackIndex);
     ~AlarmPopupWindow();
 
     bool Create();
@@ -43,7 +43,6 @@ private:
     std::wstring m_text;
     bool         m_playSound;
     std::wstring m_soundFile;
-    int          m_snoozeMinutes;
     int          m_stackIndex;
 
     HWND m_hwnd       = nullptr;
@@ -57,6 +56,7 @@ private:
 
     bool m_soundActive = false;
     bool m_actionTaken = false;
+    UINT m_dpi         = 96;   // monitor DPI the popup is laid out for
 
     static bool s_classRegistered;
 };

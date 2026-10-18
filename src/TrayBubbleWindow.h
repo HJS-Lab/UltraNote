@@ -4,9 +4,11 @@
 #include <string>
 
 // Custom-drawn balloon popup shown while the mouse hovers the systray icon.
-// Replaces the default Windows tooltip (szTip left empty) to give UltraNote
-// a distinctive sticky-note look: rounded rectangle body + short tail pointing
-// at the tray icon. Single instance, owned by Application.
+// Replaces the default Windows tooltip: szTip stays set (the shell only sends
+// NIN_POPUPOPEN for icons that have a tip) but NIF_SHOWTIP is omitted, so the
+// stock tooltip never appears and this bubble takes its place - a distinctive
+// sticky-note look: rounded rectangle body + short tail pointing at the tray
+// icon. Single instance, owned by Application.
 class TrayBubbleWindow {
 public:
     bool Create(HINSTANCE hInst);

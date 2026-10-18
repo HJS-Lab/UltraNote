@@ -13,8 +13,9 @@ int WINAPI wWinMain(
     // Use system default for date/time formatting (wcsftime weekday/month names)
     setlocale(LC_TIME, "");
 
-    // Initialize COM/OLE (needed for SHGetFileInfoW on .lnk files, drag & drop)
-    OleInitialize(nullptr);
+    // Initialize COM/OLE (needed for SHGetFileInfoW on .lnk files, drag & drop).
+    // Balance OleUninitialize only against a successful init (S_OK / S_FALSE).
+    HRESULT hrOle = OleInitialize(nullptr);
 
     // Enable visual styles (ComCtl v6)
     INITCOMMONCONTROLSEX icc = {};
@@ -27,6 +28,6 @@ int WINAPI wWinMain(
         return 1;
 
     int result = app.Run();
-    OleUninitialize();
+    if (SUCCEEDED(hrOle)) OleUninitialize();
     return result;
 }

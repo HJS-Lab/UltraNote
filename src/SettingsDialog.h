@@ -71,8 +71,10 @@ public:
     // Load current settings from storage
     static SettingsData LoadFromStorage();
 
-    // Save settings to storage
-    static void SaveToStorage(const SettingsData& data);
+    // Save settings to storage. Returns false when settings.json could not be
+    // written (locked / disk full); callers must tell the user instead of
+    // silently applying values that will not survive a restart.
+    static bool SaveToStorage(const SettingsData& data);
 
     // Get default shortcut definitions
     static const ShortcutDef* GetShortcutDefs();
@@ -104,6 +106,8 @@ private:
     void OnShortcutSelChange();
     void OnShortcutChange();
     void OnShortcutDefault();
+    // True (after telling the user) if `hk` is already bound to another slot.
+    bool ShortcutConflicts(int sel, WORD hk) const;
     void PopulateLanguageCombo();
     void PopulateFolderCombo();
     void ShowInsertVariableMenu();

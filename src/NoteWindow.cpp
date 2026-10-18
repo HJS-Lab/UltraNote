@@ -36,12 +36,17 @@ NoteWindow::NoteWindow(NoteData* data, HINSTANCE hInst)
     DWORD exStyle = WS_EX_TOOLWINDOW;
     if (data->layout.alwaysOnTop)
         exStyle |= WS_EX_TOPMOST;
+    // Hidden notes (hover preview) get their window created invisible: a
+    // WS_VISIBLE popup is activated on creation and would steal the keyboard
+    // from the note list. Show(true) then uses SW_SHOWNOACTIVATE.
+    DWORD style = WS_POPUP | WS_CLIPCHILDREN;
+    if (!data->isHidden) style |= WS_VISIBLE;
 
     m_hwnd = CreateWindowExW(
         exStyle,
         NOTE_WND_CLASS,
         nullptr,
-        WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
+        style,
         data->x, data->y, data->width, data->height,
         nullptr, nullptr, hInst, this
     );
@@ -82,6 +87,9 @@ NoteWindow::~NoteWindow() {
         DeleteObject(m_hEditBrush);
         m_hEditBrush = nullptr;
     }
+    if (m_hTextFont)   { DeleteObject(m_hTextFont);   m_hTextFont   = nullptr; }
+    if (m_hUrlFont)    { DeleteObject(m_hUrlFont);    m_hUrlFont    = nullptr; }
+    if (m_hAttachFont) { DeleteObject(m_hAttachFont); m_hAttachFont = nullptr; }
     if (m_hTooltip) {
         DestroyWindow(m_hTooltip);
         m_hTooltip = nullptr;
@@ -144,11 +152,15 @@ LRESULT NoteWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             // next WM_LBUTTONUP would take the URL branch and swallow the
             // EndDrag/EndResize, leaving the note stuck to the cursor.
             m_pendingUrlClick = -1;
+            m_pendingAttachClick = -1;
 
-            // Check if click is in attachment bar (works even in edit mode)
+            // Check if click is in attachment bar (works even in edit mode).
+            // Remember the row: WM_LBUTTONUP opens it only when the button goes
+            // up over the same row, and the DBLCLK handler clears it so the
+            // second button-up of a double-click doesn't open the file again.
             if (m_data->showAttachments && !m_data->attachments.empty()) {
                 int attachIdx = AttachmentHitTest(x, y);
-                if (attachIdx >= 0) return 0; // Consume; single click opens on WM_LBUTTONUP
+                if (attachIdx >= 0) { m_pendingAttachClick = attachIdx; return 0; }
             }
 
             if (m_inEditMode) break; // Let edit control handle it
@@ -269,19 +281,19 @@ LRESULT NoteWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
 
-            if (m_data->showAttachments) {
-                // Single click on attachment opens file
-                int attachIdx = AttachmentHitTest(x, y);
-                if (attachIdx >= 0) {
+            if (m_pendingAttachClick >= 0) {
+                int attachIdx = m_pendingAttachClick;
+                m_pendingAttachClick = -1;
+                // Single click (down + up on the same row) opens the file
+                if (m_data->showAttachments && AttachmentHitTest(x, y) == attachIdx)
                     OpenAttachment(attachIdx);
-                    return 0;
-                }
             }
             return 0;
         }
 
         case WM_LBUTTONDBLCLK: {
-            m_pendingUrlClick = -1;  // Cancel pending URL click
+            m_pendingUrlClick = -1;     // Cancel pending URL click
+            m_pendingAttachClick = -1;  // ... and pending attachment click
             // Attachment bar: the single click already opened the file on
             // WM_LBUTTONUP; swallow the dblclick so we neither re-open it nor
             // drop into edit mode over the attachment.
@@ -316,6 +328,30 @@ LRESULT NoteWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowContextMenu(pt.x, pt.y);
             return 0;
         }
+
+        case WM_SETFOCUS:
+            // Activation comes back to the note (e.g. the find dialog closed):
+            // put the keyboard into the live EDIT, not the frame window - else
+            // typing went nowhere and the edit mode lingered without a caret.
+            if (m_inEditMode && m_hEditCtrl && IsWindow(m_hEditCtrl)) {
+                SetFocus(m_hEditCtrl);
+                return 0;
+            }
+            break;
+
+        case WM_KEYUP:
+        case WM_SYSKEYUP:
+            // The WM_SYSCHAR of a consumed Alt-shortcut always precedes its key-up;
+            // if none came (Alt+F-key, Alt+Del) the flag must not linger and eat
+            // the next legitimate Alt mnemonic.
+            m_swallowNextSysChar = false;
+            break;
+
+        case WM_SYSCHAR:
+            // An Alt+<key> consumed as a shortcut below still yields a WM_SYSCHAR
+            // from TranslateMessage; DefWindowProc would beep on it.
+            if (m_swallowNextSysChar) { m_swallowNextSysChar = false; return 0; }
+            break;
 
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
@@ -357,24 +393,15 @@ LRESULT NoteWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (!isSlotVk) break;
                 }
 
-                if (MatchesShortcut(settings.shortcuts[SC_DELETE], wParam)) {
-                    HWND appWnd = FindWindowW(L"UltraNoteApp", L"UltraNote");
-                    if (appWnd)
-                        PostMessageW(appWnd, WM_NOTE_REQUEST_DELETE,
-                                     static_cast<WPARAM>(m_data->id), 0);
-                    return 0;
-                }
-
-                if (MatchesShortcut(settings.shortcuts[SC_ALWAYS_ON_TOP], wParam)) {
-                    m_data->layout.alwaysOnTop = !m_data->layout.alwaysOnTop;
-                    SetWindowPos(m_hwnd, m_data->layout.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
-                                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                    NotifyChanged();
-                    return 0;
-                }
-
-                if (MatchesShortcut(settings.shortcuts[SC_HIDE], wParam)) {
-                    HandleMenuCommand(ID_NOTE_HIDE);
+                // The three slots share the menu command handlers (single
+                // implementation per action). Alt-bindings: swallow the SYSCHAR.
+                int cmd = 0;
+                if (MatchesShortcut(settings.shortcuts[SC_DELETE], wParam))             cmd = ID_NOTE_DELETE;
+                else if (MatchesShortcut(settings.shortcuts[SC_ALWAYS_ON_TOP], wParam)) cmd = ID_NOTE_ALWAYSONTOP;
+                else if (MatchesShortcut(settings.shortcuts[SC_HIDE], wParam))          cmd = ID_NOTE_HIDE;
+                if (cmd != 0) {
+                    if (msg == WM_SYSKEYDOWN) m_swallowNextSysChar = true;
+                    HandleMenuCommand(cmd);
                     return 0;
                 }
             }
@@ -426,10 +453,30 @@ LRESULT NoteWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 // WM_CANCELMODE asks us to abort the modal loop; capture is not
                 // yet gone (unlike WM_CAPTURECHANGED), so release it explicitly.
                 if (msg == WM_CANCELMODE) ReleaseCapture();
-                SyncDataFromWindow();
-                NotifyChanged();
+                if (SyncDataFromWindow()) NotifyChanged();
             }
             m_pendingUrlClick = -1;
+            m_pendingAttachClick = -1;
+            return 0;
+
+        case WM_SYSCOMMAND:
+            // Alt+F4 on a note (DefWindowProc turns it into SC_CLOSE). Without
+            // this, DefWindowProc would DestroyWindow the note: the object stayed
+            // in m_noteWindows with a dead HWND, the note was gone until restart,
+            // and CommitEditingNotes read an EMPTY text at exit. Treat it as the
+            // user-facing "Hide" action (commits a running edit first).
+            if ((wParam & 0xFFF0) == SC_CLOSE) {
+                HandleMenuCommand(ID_NOTE_HIDE);
+                return 0;
+            }
+            break;
+
+        case WM_CLOSE:
+            // An external WM_CLOSE (taskkill without /F, "End task") is sent to
+            // every top-level window of the process. Route it to the app window
+            // so the whole app exits cleanly (save + tray cleanup) instead of
+            // this note window being destroyed behind our back.
+            PostMessageW(Application::Get().GetAppWindow(), WM_CLOSE, 0, 0);
             return 0;
 
         case WM_DESTROY:
@@ -512,20 +559,18 @@ void NoteWindow::PaintText(HDC hdc, const RECT& rc) {
         return;
     }
 
-    HFONT hFont = CreateFontFromParams(m_data->layout.fontFace,
-                                        m_data->layout.fontSizePts,
-                                        m_data->layout.fontBold,
-                                        m_data->layout.fontItalic, hdc);
+    HFONT hFont = GetTextFont(hdc);
     GdiSelect fontSel(hdc, hFont);
 
     SetBkMode(hdc, TRANSPARENT);
 
     int abHeight = GetAttachmentBarHeight();
+    const int pad = Px(TEXT_PADDING);
     RECT textRc = {
-        rc.left + TEXT_PADDING,
-        rc.top + TEXT_PADDING,
-        rc.right - TEXT_PADDING,
-        rc.bottom - TEXT_PADDING - abHeight
+        rc.left + pad,
+        rc.top + pad,
+        rc.right - pad,
+        rc.bottom - pad - abHeight
     };
 
     // Scan for URLs once and hand the result to PaintTextWithLinks, which used to
@@ -550,8 +595,31 @@ void NoteWindow::PaintText(HDC hdc, const RECT& rc) {
         DrawTextW(hdc, m_data->text.c_str(), static_cast<int>(m_data->text.size()),
                   &textRc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
     }
+}
 
-    DeleteObject(hFont);
+HFONT NoteWindow::GetTextFont(HDC hdc) {
+    const NoteLayout& l = m_data->layout;
+    if (!m_hTextFont || m_fontKeySize != l.fontSizePts || m_fontKeyBold != l.fontBold ||
+        m_fontKeyItalic != l.fontItalic || m_fontKeyFace != l.fontFace) {
+        if (m_hTextFont) DeleteObject(m_hTextFont);
+        if (m_hUrlFont)  { DeleteObject(m_hUrlFont); m_hUrlFont = nullptr; }
+        m_hTextFont     = CreateFontFromParams(l.fontFace, l.fontSizePts, l.fontBold, l.fontItalic, hdc);
+        m_fontKeyFace   = l.fontFace;
+        m_fontKeySize   = l.fontSizePts;
+        m_fontKeyBold   = l.fontBold;
+        m_fontKeyItalic = l.fontItalic;
+    }
+    return m_hTextFont;
+}
+
+HFONT NoteWindow::GetUrlFont(HDC hdc) {
+    if (!m_hUrlFont) {
+        LOGFONTW lf = {};
+        GetObjectW(GetTextFont(hdc), sizeof(lf), &lf);
+        lf.lfUnderline = TRUE;
+        m_hUrlFont = CreateFontIndirectW(&lf);
+    }
+    return m_hUrlFont;
 }
 
 void NoteWindow::PaintTextWithLinks(HDC hdc, const RECT& textRc,
@@ -560,14 +628,16 @@ void NoteWindow::PaintTextWithLinks(HDC hdc, const RECT& textRc,
 
     const std::wstring& text = m_data->text;
 
-    // Lowercase copy of text for case-insensitive highlight matching
+    // Lowercase copies for case-insensitive highlight matching. CharLowerBuffW
+    // folds the full Unicode range; towlower only folded A-Z under the C
+    // LC_CTYPE (searching "über" never highlighted "Übersicht").
     const std::wstring& hlTerm = Application::Get().GetSearchHighlight();
     std::wstring textLower, hlLower;
     if (!hlTerm.empty()) {
-        textLower.resize(text.size());
-        for (size_t i = 0; i < text.size(); ++i) textLower[i] = towlower(text[i]);
-        hlLower.resize(hlTerm.size());
-        for (size_t i = 0; i < hlTerm.size(); ++i) hlLower[i] = towlower(hlTerm[i]);
+        textLower = text;
+        hlLower   = hlTerm;
+        if (!textLower.empty()) CharLowerBuffW(&textLower[0], static_cast<DWORD>(textLower.size()));
+        CharLowerBuffW(&hlLower[0], static_cast<DWORD>(hlLower.size()));
     }
 
     TEXTMETRICW tm;
@@ -577,12 +647,11 @@ void NoteWindow::PaintTextWithLinks(HDC hdc, const RECT& textRc,
 
     if (maxWidth <= 0 || lineHeight <= 0) return;
 
-    // Create underlined font for URL segments
-    LOGFONTW lf;
-    HFONT hCurFont = static_cast<HFONT>(GetCurrentObject(hdc, OBJ_FONT));
-    GetObjectW(hCurFont, sizeof(lf), &lf);
-    lf.lfUnderline = TRUE;
-    HFONT hUrlFont = CreateFontIndirectW(&lf);
+    // Underlined font for URL segments (cached) and ONE highlight brush for all
+    // matches of this paint (was one CreateSolidBrush per match).
+    HFONT hUrlFont = GetUrlFont(hdc);
+    HBRUSH hHlBrush = hlLower.empty() ? nullptr
+                      : CreateSolidBrush(Application::Get().GetSearchHighlightColor());
 
     int textLen = static_cast<int>(text.size());
     int curY = textRc.top;
@@ -676,9 +745,7 @@ void NoteWindow::PaintTextWithLinks(HDC hdc, const RECT& textRc,
                         textRc.left + szPre.cx, curY,
                         textRc.left + szPre.cx + szMatch.cx, curY + lineHeight
                     };
-                    HBRUSH hHlBrush = CreateSolidBrush(Application::Get().GetSearchHighlightColor());
-                    FillRect(hdc, &hlRc, hHlBrush);
-                    DeleteObject(hHlBrush);
+                    if (hHlBrush) FillRect(hdc, &hlRc, hHlBrush);
 
                     searchFrom = mEnd;
                 }
@@ -735,7 +802,7 @@ void NoteWindow::PaintTextWithLinks(HDC hdc, const RECT& textRc,
     // Restore clip region
     SelectClipRgn(hdc, nullptr);
     DeleteObject(hClip);
-    DeleteObject(hUrlFont);
+    if (hHlBrush) DeleteObject(hHlBrush);
 }
 
 // ============================================================================
@@ -746,10 +813,11 @@ int NoteWindow::HitTest(int x, int y) const {
     RECT rc;
     GetClientRect(m_hwnd, &rc);
 
-    bool nearLeft   = x < RESIZE_BORDER;
-    bool nearRight  = x >= rc.right - RESIZE_BORDER;
-    bool nearTop    = y < RESIZE_BORDER;
-    bool nearBottom = y >= rc.bottom - RESIZE_BORDER;
+    const int border = Px(RESIZE_BORDER);
+    bool nearLeft   = x < border;
+    bool nearRight  = x >= rc.right - border;
+    bool nearTop    = y < border;
+    bool nearBottom = y >= rc.bottom - border;
 
     if (nearTop && nearLeft)     return HTTOPLEFT;
     if (nearTop && nearRight)    return HTTOPRIGHT;
@@ -803,8 +871,10 @@ void NoteWindow::UpdateDrag(int x, int y) {
 void NoteWindow::EndDrag() {
     m_dragging = false;
     ReleaseCapture();
-    SyncDataFromWindow();
-    NotifyChanged();
+    // Only report a change when the note actually moved: a plain click
+    // (press + release without motion) otherwise dirtied notes.json, refreshed
+    // the list and triggered an autosave write.
+    if (SyncDataFromWindow()) NotifyChanged();
 }
 
 // ============================================================================
@@ -866,8 +936,7 @@ void NoteWindow::UpdateResize(int x, int y) {
 void NoteWindow::EndResize() {
     m_resizing = false;
     ReleaseCapture();
-    SyncDataFromWindow();
-    NotifyChanged();
+    if (SyncDataFromWindow()) NotifyChanged();   // see EndDrag
 }
 
 // ============================================================================
@@ -882,13 +951,14 @@ void NoteWindow::EnterEditMode() {
     GetClientRect(m_hwnd, &rc);
 
     int abHeight = GetAttachmentBarHeight();
+    const int pad = Px(TEXT_PADDING);
     m_hEditCtrl = CreateWindowExW(
         0, L"EDIT", m_data->text.c_str(),
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN |
         ES_AUTOVSCROLL | ES_NOHIDESEL,
-        TEXT_PADDING, TEXT_PADDING,
-        rc.right - 2 * TEXT_PADDING,
-        rc.bottom - 2 * TEXT_PADDING - abHeight,
+        pad, pad,
+        rc.right - 2 * pad,
+        rc.bottom - 2 * pad - abHeight,
         m_hwnd, nullptr, m_hInst, nullptr
     );
 
@@ -910,6 +980,10 @@ void NoteWindow::EnterEditMode() {
     SendMessageW(m_hEditCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
     // Remove internal edit margins so text doesn't shift vs. owner-draw rendering
     SendMessageW(m_hEditCtrl, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
+    // Lift the EDIT default text limit (30,000 chars for a multiline control):
+    // longer pastes were silently truncated and then saved truncated, and notes
+    // already longer than that refused any further typing. 0 = maximum.
+    SendMessageW(m_hEditCtrl, EM_SETLIMITTEXT, 0, 0);
     // Force format rect to full client rect so word-wrap width matches DrawText
     // (EDIT control otherwise reserves implicit caret space at the right edge,
     //  causing wrap to happen ~2px earlier than in PaintText/DT_EDITCONTROL).
@@ -927,10 +1001,10 @@ void NoteWindow::EnterEditMode() {
     const std::wstring& hlTerm = Application::Get().GetSearchHighlight();
     int hlMatchPos = -1;
     if (!hlTerm.empty()) {
-        std::wstring textLower(m_data->text.size(), L'\0');
-        std::wstring hlLower(hlTerm.size(), L'\0');
-        for (size_t i = 0; i < m_data->text.size(); ++i) textLower[i] = towlower(m_data->text[i]);
-        for (size_t i = 0; i < hlTerm.size(); ++i) hlLower[i] = towlower(hlTerm[i]);
+        std::wstring textLower = m_data->text;
+        std::wstring hlLower   = hlTerm;
+        if (!textLower.empty()) CharLowerBuffW(&textLower[0], static_cast<DWORD>(textLower.size()));
+        CharLowerBuffW(&hlLower[0], static_cast<DWORD>(hlLower.size()));
         size_t found = textLower.find(hlLower);
         if (found != std::wstring::npos) hlMatchPos = static_cast<int>(found);
     }
@@ -957,12 +1031,17 @@ void NoteWindow::EnterEditMode() {
 }
 
 void NoteWindow::CommitEditText() {
-    if (!m_inEditMode || !m_hEditCtrl) return;
+    // IsWindow guard: never overwrite the note text with the "" a dead control
+    // would report (GetWindowTextLengthW == 0 on an invalid HWND).
+    if (!m_inEditMode || !m_hEditCtrl || !IsWindow(m_hEditCtrl)) return;
 
     int len = GetWindowTextLengthW(m_hEditCtrl);
     std::wstring text(static_cast<size_t>(len), L'\0');
     if (len > 0)
         GetWindowTextW(m_hEditCtrl, &text[0], len + 1);
+    // Untouched text: no "modified" stamp (list column/sort order) and no
+    // notes.json write for merely opening and closing the editor.
+    if (text == m_data->text) return;
     m_data->text = std::move(text);
     m_data->modifiedAt = static_cast<int64_t>(std::time(nullptr));
     NotifyChanged();
@@ -1020,26 +1099,30 @@ LRESULT CALLBACK NoteWindow::EditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam
                     return hk != 0 &&
                            (HIBYTE(hk) & (HOTKEYF_CONTROL | HOTKEYF_ALT)) != 0;
                 };
-                if (hasCtrlAlt(sc[SC_HIDE]) &&
-                    MatchesShortcut(sc[SC_HIDE], wParam)) {
-                    self->ExitEditMode(true);
-                    self->HandleMenuCommand(ID_NOTE_HIDE);
-                    return 0;
-                }
-                if (hasCtrlAlt(sc[SC_ALWAYS_ON_TOP]) &&
-                    MatchesShortcut(sc[SC_ALWAYS_ON_TOP], wParam)) {
-                    self->HandleMenuCommand(ID_NOTE_ALWAYSONTOP);
-                    return 0;
-                }
-                if (hasCtrlAlt(sc[SC_DELETE]) &&
-                    MatchesShortcut(sc[SC_DELETE], wParam)) {
-                    HWND appWnd = FindWindowW(L"UltraNoteApp", L"UltraNote");
-                    if (appWnd)
-                        PostMessageW(appWnd, WM_NOTE_REQUEST_DELETE,
-                                     static_cast<WPARAM>(self->m_data->id), 0);
+                int cmd = 0;
+                if (hasCtrlAlt(sc[SC_HIDE]) && MatchesShortcut(sc[SC_HIDE], wParam))
+                    cmd = ID_NOTE_HIDE;   // ID_NOTE_HIDE commits + tears down the editor itself
+                else if (hasCtrlAlt(sc[SC_ALWAYS_ON_TOP]) && MatchesShortcut(sc[SC_ALWAYS_ON_TOP], wParam))
+                    cmd = ID_NOTE_ALWAYSONTOP;
+                else if (hasCtrlAlt(sc[SC_DELETE]) && MatchesShortcut(sc[SC_DELETE], wParam))
+                    cmd = ID_NOTE_DELETE;
+                if (cmd != 0) {
+                    self->m_swallowNextSysChar = (msg == WM_SYSKEYDOWN);
+                    self->HandleMenuCommand(cmd);
                     return 0;
                 }
             }
+            break;
+
+        case WM_KEYUP:
+        case WM_SYSKEYUP:
+            self->m_swallowNextSysChar = false;   // no SYSCHAR came: don't eat the next mnemonic
+            break;
+
+        case WM_SYSCHAR:
+            // See NoteWindow::HandleMessage: the SYSCHAR following a consumed
+            // Alt-shortcut must not reach the EDIT (DefWindowProc beeps).
+            if (self->m_swallowNextSysChar) { self->m_swallowNextSysChar = false; return 0; }
             break;
 
         case WM_CONTEXTMENU: {
@@ -1121,7 +1204,7 @@ void NoteWindow::ShowContextMenu(int screenX, int screenY) {
             if (m_data->folder == folders[i]) flags |= MF_CHECKED;
             AppendMenuW(hFolderSub, flags,
                         ID_NL_FOLDER_BASE + static_cast<UINT>(i + 1),
-                        folders[i].c_str());
+                        EscapeMenuText(folders[i]).c_str());
         }
         {
             MENUITEMINFOW mii = {};
@@ -1182,13 +1265,12 @@ void NoteWindow::HandleMenuCommand(int cmd) {
             break;
         }
 
-        case ID_NOTE_DELETE: {
-            HWND appWnd = FindWindowW(L"UltraNoteApp", L"UltraNote");
-            if (appWnd)
-                PostMessageW(appWnd, WM_NOTE_REQUEST_DELETE,
-                             static_cast<WPARAM>(m_data->id), 0);
+        case ID_NOTE_DELETE:
+            // Posted, not called: the confirmation + deletion must not run on
+            // top of this window's own message handler (it deletes `this`).
+            PostMessageW(Application::Get().GetAppWindow(), WM_NOTE_REQUEST_DELETE,
+                         static_cast<WPARAM>(m_data->id), 0);
             break;
-        }
 
         case ID_NOTE_ALWAYSONTOP:
             m_data->layout.alwaysOnTop = !m_data->layout.alwaysOnTop;
@@ -1230,12 +1312,8 @@ void NoteWindow::HandleMenuCommand(int cmd) {
             // Commit and tear down the editor first; otherwise unsaved text is
             // lost and the EDIT control lingers on the hidden window.
             if (m_inEditMode) ExitEditMode(true);
-            // Hide the in-note find dialog too — leaving it open would let
-            // "Find Next" re-create an EDIT control on the now-invisible note.
-            if (m_findDialog && m_findDialog->GetHwnd())
-                ShowWindow(m_findDialog->GetHwnd(), SW_HIDE);
             m_data->isHidden = true;
-            Show(false);
+            Show(false);   // also hides the find dialog
             NotifyChanged();
             Application::Get().RefreshNoteList();
             break;
@@ -1302,10 +1380,11 @@ void NoteWindow::LayoutEditCtrl() {
     RECT rc;
     GetClientRect(m_hwnd, &rc);
     int abHeight = GetAttachmentBarHeight();
+    const int pad = Px(TEXT_PADDING);
     MoveWindow(m_hEditCtrl,
-               TEXT_PADDING, TEXT_PADDING,
-               rc.right  - 2 * TEXT_PADDING,
-               rc.bottom - 2 * TEXT_PADDING - abHeight,
+               pad, pad,
+               rc.right  - 2 * pad,
+               rc.bottom - 2 * pad - abHeight,
                TRUE);
     // MoveWindow resets the EDIT control's formatting rect to its default
     // (which reserves implicit caret space at the right edge, wrapping ~2px
@@ -1319,11 +1398,11 @@ void NoteWindow::LayoutEditCtrl() {
 void NoteWindow::InsertFilePathAtCursor() {
     if (!m_hEditCtrl) return;
 
-    wchar_t file[MAX_PATH] = {};
+    std::vector<wchar_t> file(32768, L'\0');   // long-path safe (FNERR_BUFFERTOOSMALL otherwise)
     OPENFILENAMEW ofn = { sizeof(ofn) };
     ofn.hwndOwner   = m_hwnd;
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.lpstrFilter = L"All Files (*.*)\0*.*\0";
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY |
                       OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
@@ -1336,7 +1415,7 @@ void NoteWindow::InsertFilePathAtCursor() {
 
     if (ok) {
         SetFocus(m_hEditCtrl);
-        InsertAtCursor(file);
+        InsertAtCursor(file.data());
     }
 }
 
@@ -1469,21 +1548,36 @@ void NoteWindow::ShowEditContextMenu(int screenX, int screenY) {
 int NoteWindow::GetAttachmentBarHeight() const {
     if (!m_data->showAttachments || m_data->attachments.empty())
         return 0;
-    return static_cast<int>(m_data->attachments.size()) * ATTACH_ROW_HEIGHT + 1;  // +1 for separator
+    return static_cast<int>(m_data->attachments.size()) * Px(ATTACH_ROW_HEIGHT) + 1;  // +1 for separator
 }
 
 RECT NoteWindow::GetAttachmentBarRect() const {
     RECT rc;
     GetClientRect(m_hwnd, &rc);
     int h = GetAttachmentBarHeight();
-    // Leave RESIZE_BORDER free at bottom and right for resize grip
+    // Leave the resize border free at bottom and right for the resize grip
+    const int border = Px(RESIZE_BORDER);
     RECT barRc = {
-        RESIZE_BORDER,
-        rc.bottom - h - RESIZE_BORDER,
-        rc.right - RESIZE_BORDER,
-        rc.bottom - RESIZE_BORDER
+        border,
+        rc.bottom - h - border,
+        rc.right - border,
+        rc.bottom - border
     };
     return barRc;
+}
+
+HFONT NoteWindow::GetAttachFont() {
+    // Message font for the note's current monitor DPI (DEFAULT_GUI_FONT is a
+    // fixed 96-dpi stock font). Rebuilt when the note moves to another DPI.
+    UINT dpi = WindowDpi(m_hwnd);
+    if (!m_hAttachFont || m_attachFontDpi != dpi) {
+        if (m_hAttachFont) DeleteObject(m_hAttachFont);
+        NONCLIENTMETRICSW ncm;
+        GetNonClientMetricsForDpi(ncm, dpi);
+        m_hAttachFont = CreateFontIndirectW(&ncm.lfMessageFont);
+        m_attachFontDpi = dpi;
+    }
+    return m_hAttachFont ? m_hAttachFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 }
 
 void NoteWindow::UpdateTooltip() {
@@ -1513,11 +1607,12 @@ int NoteWindow::AttachmentHitTest(int x, int y) const {
         return -1;
 
     // Each attachment is one row; find which row was hit
+    const int rowH = Px(ATTACH_ROW_HEIGHT);
     int rowY = barRc.top + 1;  // skip separator line
     for (int i = 0; i < static_cast<int>(m_data->attachments.size()); ++i) {
-        if (y >= rowY && y < rowY + ATTACH_ROW_HEIGHT)
+        if (y >= rowY && y < rowY + rowH)
             return i;
-        rowY += ATTACH_ROW_HEIGHT;
+        rowY += rowH;
     }
     return -1;
 }
@@ -1551,12 +1646,13 @@ void NoteWindow::PaintAttachmentBar(HDC hdc, const RECT& /*rc*/) {
         for (auto& path : m_data->attachments) {
             SHFILEINFOW sfi = {};
             HICON hIcon = nullptr;
-            // Probe existence first. A dead UNC path passed to SHGetFileInfoW
-            // without SHGFI_USEFILEATTRIBUTES makes the shell hit the network and
-            // block the UI thread on the connect timeout (seconds). If the file
-            // is unreachable, skip the blocking query and resolve the icon purely
-            // from the extension via SHGFI_USEFILEATTRIBUTES (no I/O).
-            bool exists = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+            // Remote paths (UNC / mapped network drive) are never probed: even
+            // GetFileAttributesW blocks the UI thread until the SMB timeout when
+            // the host is gone, so their icon comes from the extension alone via
+            // SHGFI_USEFILEATTRIBUTES (no I/O). Local files are probed so a
+            // missing one falls back the same way instead of a slow shell query.
+            bool remote = PathIsUNCW(path.c_str()) || PathIsNetworkPathW(path.c_str());
+            bool exists = !remote && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
             if (exists && SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi),
                                          SHGFI_ICON | SHGFI_SMALLICON)) {
                 hIcon = sfi.hIcon;
@@ -1571,30 +1667,33 @@ void NoteWindow::PaintAttachmentBar(HDC hdc, const RECT& /*rc*/) {
         }
     }
 
-    HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HFONT hFont = GetAttachFont();
     HGDIOBJ oldFontObj = SelectObject(hdc, hFont);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, m_data->layout.textColor);
 
+    const int rowH   = Px(ATTACH_ROW_HEIGHT);
+    const int iconSz = Px(ATTACH_ICON_SIZE);
+    const int pad    = Px(ATTACH_ITEM_PAD);
     int rowY = barRc.top + 1;  // below separator line
     for (size_t i = 0; i < m_data->attachments.size(); ++i) {
-        int iconX = barRc.left + ATTACH_ITEM_PAD;
-        int iconY = rowY + (ATTACH_ROW_HEIGHT - ATTACH_ICON_SIZE) / 2;
+        int iconX = barRc.left + pad;
+        int iconY = rowY + (rowH - iconSz) / 2;
 
         // Draw icon
         if (i < m_attachIcons.size() && m_attachIcons[i]) {
             DrawIconEx(hdc, iconX, iconY, m_attachIcons[i],
-                       ATTACH_ICON_SIZE, ATTACH_ICON_SIZE, 0, nullptr, DI_NORMAL);
+                       iconSz, iconSz, 0, nullptr, DI_NORMAL);
         }
 
         // Draw filename (ellipsis if too wide)
-        int textX = iconX + ATTACH_ICON_SIZE + ATTACH_ITEM_PAD;
+        int textX = iconX + iconSz + pad;
         const wchar_t* filename = PathFindFileNameW(m_data->attachments[i].c_str());
-        RECT textRc = { textX, rowY, barRc.right - ATTACH_ITEM_PAD, rowY + ATTACH_ROW_HEIGHT };
+        RECT textRc = { textX, rowY, barRc.right - pad, rowY + rowH };
         DrawTextW(hdc, filename, static_cast<int>(wcslen(filename)),
                   &textRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-        rowY += ATTACH_ROW_HEIGHT;
+        rowY += rowH;
     }
 
     SelectObject(hdc, oldFontObj);
@@ -1651,8 +1750,9 @@ void NoteWindow::ShowAttachmentContextMenu(int index, int screenX, int screenY) 
 
     auto& app = Application::Get();
 
-    // Show full path as disabled header
-    AppendMenuW(hPopup, MF_STRING | MF_GRAYED, 0, m_data->attachments[index].c_str());
+    // Show full path as disabled header ('&' in file names escaped)
+    AppendMenuW(hPopup, MF_STRING | MF_GRAYED, 0,
+                EscapeMenuText(m_data->attachments[index]).c_str());
     AppendMenuW(hPopup, MF_SEPARATOR, 0, nullptr);
 
     // Remove entry with delete icon
@@ -1680,6 +1780,11 @@ void NoteWindow::DestroyAttachmentIcons() {
 // ============================================================================
 
 void NoteWindow::Show(bool show) {
+    // Hide the in-note find dialog together with the note (every hide path:
+    // menu, shortcut, note list, "Hide all") - leaving it open would let
+    // "Find Next" re-create an EDIT control on the now-invisible note.
+    if (!show && m_findDialog && m_findDialog->GetHwnd())
+        ShowWindow(m_findDialog->GetHwnd(), SW_HIDE);
     ShowWindow(m_hwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
@@ -1704,19 +1809,22 @@ void NoteWindow::OffsetPosition(int dx, int dy) {
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-void NoteWindow::SyncDataFromWindow() {
+bool NoteWindow::SyncDataFromWindow() {
     RECT rc;
     GetWindowRect(m_hwnd, &rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    bool changed = m_data->x != rc.left || m_data->y != rc.top ||
+                   m_data->width != w || m_data->height != h;
     m_data->x = rc.left;
     m_data->y = rc.top;
-    m_data->width = rc.right - rc.left;
-    m_data->height = rc.bottom - rc.top;
+    m_data->width = w;
+    m_data->height = h;
+    return changed;
 }
 
 void NoteWindow::NotifyChanged() {
-    HWND appWnd = FindWindowW(L"UltraNoteApp", L"UltraNote");
-    if (appWnd)
-        PostMessageW(appWnd, WM_NOTE_CHANGED, 0, 0);
+    PostMessageW(Application::Get().GetAppWindow(), WM_NOTE_CHANGED, 0, 0);
 }
 
 // ============================================================================
@@ -1766,6 +1874,18 @@ bool NoteWindow::FindNextInNote(const std::wstring& term, bool caseSensitive, bo
         m_findSearchPos = 0;
         m_findLastMatchStart = std::wstring::npos;
         m_findLastMatchEnd   = std::wstring::npos;
+        // EnterEditMode's SetFocus activated the note: hand the activation
+        // straight back to the find dialog - on EVERY outcome, a miss included,
+        // else the next keystroke (a corrected search term) would edit the note
+        // text. m_editModalOpen guards the EDIT's KILLFOCUS teardown during the
+        // switch, like the common-dialog case; ES_NOHIDESEL keeps a later match
+        // visible on the inactive note.
+        HWND findHwnd = m_findDialog ? m_findDialog->GetHwnd() : nullptr;
+        if (findHwnd && IsWindowVisible(findHwnd) && GetActiveWindow() != findHwnd) {
+            m_editModalOpen = true;
+            SetActiveWindow(findHwnd);
+            m_editModalOpen = false;
+        }
     }
     if (!m_hEditCtrl) return false;
 
@@ -1788,7 +1908,8 @@ bool NoteWindow::FindNextInNote(const std::wstring& term, bool caseSensitive, bo
     }
 
     auto toLower = [](std::wstring s) {
-        for (auto& c : s) c = towlower(c);
+        // Unicode-aware (towlower folds only A-Z under the C LC_CTYPE)
+        if (!s.empty()) CharLowerBuffW(&s[0], static_cast<DWORD>(s.size()));
         return s;
     };
 

@@ -5,6 +5,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <ctime>
+
 #include <cstdio>   // _fileno
 #include <io.h>     // _get_osfhandle — flush the temp file to disk before rename
 
@@ -34,6 +35,61 @@ static size_t Utf8BomOffset(const std::string& s) {
 static int MaxNoteDim(int sysMetric, int fallback) {
     int m = GetSystemMetrics(sysMetric);
     return m > 0 ? m : fallback;
+}
+
+// Flush the CRT buffer and the OS cache to disk, then close. Returns false when
+// the bytes are NOT safely on disk: short write, fflush/FlushFileBuffers/fclose
+// failure (full or disconnected volume). Every return value matters here - a
+// write that "succeeded" into the CRT buffer but never reached the disk used to
+// let a zero-byte .tmp replace notes.json. FlushFileBuffers errors that only
+// mean "this volume cannot flush" (ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED,
+// e.g. some network redirectors) are ignored so saving there keeps working.
+static bool FlushAndClose(FILE* fp, bool writeOk) {
+    bool ok = writeOk;
+    if (ok && fflush(fp) != 0) ok = false;
+    if (ok) {
+        HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(fp)));
+        if (!FlushFileBuffers(h)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_INVALID_FUNCTION && e != ERROR_NOT_SUPPORTED) ok = false;
+        }
+    }
+    if (fclose(fp) != 0) ok = false;
+    return ok;
+}
+
+// Read a whole file into `out`. Returns false and sets `outUnreadable` when the
+// file exists but could not be opened/read (sharing violation from a sync
+// client, ACL, I/O error); returns false with outUnreadable == false when the
+// file simply does not exist (ENOENT) - a normal first start.
+static bool ReadWholeFile(const std::wstring& filePath, std::string& out, bool& outUnreadable) {
+    out.clear();
+    outUnreadable = false;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, filePath.c_str(), L"rb") != 0 || !fp) {
+        // "Missing" only when the file really does not exist. The CRT maps
+        // ERROR_PATH_NOT_FOUND / unreachable network paths etc. to ENOENT as
+        // well - a NAS or mapped-drive hiccup must NOT look like a fresh start
+        // (the first save would overwrite the real file).
+        DWORD attrs = GetFileAttributesW(filePath.c_str());
+        bool missing = (attrs == INVALID_FILE_ATTRIBUTES &&
+                        GetLastError() == ERROR_FILE_NOT_FOUND);
+        if (!missing) outUnreadable = true;
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    long fileSize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fileSize < 0) { fclose(fp); outUnreadable = true; return false; }
+    if (fileSize == 0) { fclose(fp); return true; }   // empty file: nothing to parse
+
+    out.assign(static_cast<size_t>(fileSize), 0);
+    size_t got = fread(&out[0], 1, static_cast<size_t>(fileSize), fp);
+    bool readErr = ferror(fp) != 0;
+    fclose(fp);
+    if (readErr) { out.clear(); outUnreadable = true; return false; }
+    if (got != static_cast<size_t>(fileSize)) out.resize(got);
+    return true;
 }
 
 // ============================================================================
@@ -77,10 +133,16 @@ static bool StringToSysTime(const std::wstring& s, SYSTEMTIME& st) {
     // stored time fails here instead of being accepted as a garbage SYSTEMTIME.
     FILETIME ft;
     SYSTEMTIME normalized = st;
-    if (!SystemTimeToFileTime(&normalized, &ft)) return false;
+    if (!SystemTimeToFileTime(&normalized, &ft) || st.wYear == 0) {
+        // Never hand back the half-parsed garbage fields: a caller that ignores
+        // the return value (or only pauses the alarm) must not end up with e.g.
+        // wMinute == 99, which AddDays cannot advance (infinite Daily loop).
+        ZeroMemory(&st, sizeof(st));
+        return false;
+    }
     FileTimeToSystemTime(&ft, &normalized);
     st.wDayOfWeek = normalized.wDayOfWeek;
-    return st.wYear != 0;
+    return true;
 }
 
 std::wstring Storage::EscapeJsonString(const std::wstring& s) {
@@ -163,6 +225,7 @@ std::wstring Storage::SerializeNote(const NoteData& note) {
         s += L"        \"snoozeMinutes\": " + std::to_wstring(a.snoozeMinutes) + L",\n";
         s += L"        \"firedCount\": " + std::to_wstring(a.firedCount) + L",\n";
         s += L"        \"snoozeUntil\": " + std::to_wstring(a.snoozeUntil) + L",\n";
+        s += L"        \"lastFired\": " + std::to_wstring(a.lastFiredSec) + L",\n";
         s += L"        \"paused\": " + std::wstring(a.paused ? L"true" : L"false") + L"\n";
         s += L"      }";
     }
@@ -218,12 +281,12 @@ bool Storage::SaveNotes(const std::vector<std::unique_ptr<NoteData>>& notes, uin
 
     size_t written = fwrite(utf8.data(), 1, utf8.size(), fp);
     // Flush to disk before the rename so a power loss can't leave a zero-byte or
-    // partial notes.json (USB-stick scenario).
-    fflush(fp);
-    FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(fp))));
-    fclose(fp);
-
-    if (written != utf8.size()) { DeleteFileW(tmpPath.c_str()); return false; }
+    // partial notes.json (USB-stick scenario). A failed flush/close means the
+    // data is not on disk: keep the old notes.json, drop the .tmp.
+    if (!FlushAndClose(fp, written == utf8.size())) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
 
     // Atomic, write-through rename
     if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(),
@@ -268,25 +331,19 @@ bool Storage::ExportNotes(const std::wstring& path,
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path.c_str(), L"wb") != 0 || !fp) return false;
     size_t written = fwrite(utf8.data(), 1, utf8.size(), fp);
-    fclose(fp);
-    return written == utf8.size();
+    if (!FlushAndClose(fp, written == utf8.size())) {
+        DeleteFileW(path.c_str());   // don't leave a truncated export behind
+        return false;
+    }
+    return true;
 }
 
 bool Storage::ImportNotes(const std::wstring& path,
-                           std::vector<std::unique_ptr<NoteData>>& outNotes) {
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return false;
-
-    fseek(fp, 0, SEEK_END);
-    long fileSize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (fileSize <= 0) { fclose(fp); return false; }
-
-    std::string utf8(static_cast<size_t>(fileSize), '\0');
-    size_t got = fread(&utf8[0], 1, static_cast<size_t>(fileSize), fp);
-    fclose(fp);
-    if (got == 0) return false;
-    if (got != static_cast<size_t>(fileSize)) utf8.resize(got);
+                           std::vector<std::unique_ptr<NoteData>>& outNotes,
+                           bool& outUnreadable) {
+    std::string utf8;
+    if (!ReadWholeFile(path, utf8, outUnreadable)) return false;
+    if (utf8.empty()) { outUnreadable = true; return false; }   // 0-byte file: nothing to import
 
     size_t bomOffset = Utf8BomOffset(utf8);
 
@@ -377,6 +434,8 @@ std::wstring Storage::UnescapeJsonString(const std::wstring& s) {
                 case L'n':  out += L'\n'; break;
                 case L'r':  out += L'\r'; break;
                 case L't':  out += L'\t'; break;
+                case L'b':  out += L'\b'; break;   // JSON escapes our writer never
+                case L'f':  out += L'\f'; break;   // emits, but imported files may
                 case L'u': {
                     bool ok = (i + 4 < s.size())
                               && iswxdigit(s[i + 1]) && iswxdigit(s[i + 2])
@@ -571,7 +630,10 @@ bool Storage::ParseNoteObject(const wchar_t*& p, NoteData& note) {
         if (key == L"id") {
             int64_t val;
             if (!ParseInt(p, val)) return false;
-            note.id = static_cast<uint64_t>(val);
+            // A negative/zero id (hand-edited file) must not wrap to a huge
+            // uint64: leave it 0 and let Application::Initialize assign a fresh
+            // one, else "nextId = id + 1" could overflow to 0 and collide.
+            note.id = (val > 0) ? static_cast<uint64_t>(val) : 0;
         } else if (key == L"text") {
             if (!ParseString(p, note.text)) return false;
         } else if (key == L"title") {
@@ -626,6 +688,12 @@ bool Storage::ParseNoteObject(const wchar_t*& p, NoteData& note) {
 bool Storage::ParseAlarmObject(const wchar_t*& p, AlarmConfig& alarm) {
     if (!Expect(p, L'{')) return false;
 
+    // Invalid stored times pause the alarm - but only AFTER the key loop: the
+    // serializer writes "paused" last, so setting alarm.paused inside the loop
+    // was overwritten by the stored value and the alarm fired on a garbage time.
+    bool invalidTime = false;
+    bool sawLastFired = false;   // key absent = file written before 2026-10
+
     while (*p && *p != L'}') {
         SkipWhitespace(p);
         if (*p == L'}') break;
@@ -641,7 +709,7 @@ bool Storage::ParseAlarmObject(const wchar_t*& p, AlarmConfig& alarm) {
             std::wstring val; if (!ParseString(p, val)) return false;
             // Invalid stored time (e.g. month 99): pause the alarm instead of
             // firing on a garbage SYSTEMTIME — and don't fail the whole parse.
-            if (!StringToSysTime(val, alarm.startTime)) alarm.paused = true;
+            if (!StringToSysTime(val, alarm.startTime)) invalidTime = true;
         } else if (key == L"intervalDays") {
             int64_t val; if (!ParseInt(p, val)) return false;
             alarm.intervalDays = ClampInt(val, 1, 365);
@@ -668,7 +736,7 @@ bool Storage::ParseAlarmObject(const wchar_t*& p, AlarmConfig& alarm) {
             alarm.endCount = ClampInt(val, 1, 100000);
         } else if (key == L"endDate") {
             std::wstring val; if (!ParseString(p, val)) return false;
-            if (!StringToSysTime(val, alarm.endDate)) alarm.paused = true;
+            if (!StringToSysTime(val, alarm.endDate)) invalidTime = true;
         } else if (key == L"popup") {
             if (!ParseBool(p, alarm.popup)) return false;
         } else if (key == L"sound") {
@@ -683,6 +751,9 @@ bool Storage::ParseAlarmObject(const wchar_t*& p, AlarmConfig& alarm) {
             alarm.firedCount = ClampInt(val, 0, 100000);
         } else if (key == L"snoozeUntil") {
             if (!ParseInt(p, alarm.snoozeUntil)) return false;
+        } else if (key == L"lastFired") {
+            if (!ParseInt(p, alarm.lastFiredSec)) return false;
+            sawLastFired = true;
         } else if (key == L"paused") {
             if (!ParseBool(p, alarm.paused)) return false;
         } else {
@@ -693,7 +764,16 @@ bool Storage::ParseAlarmObject(const wchar_t*& p, AlarmConfig& alarm) {
         if (*p == L',') ++p;
     }
 
-    return Expect(p, L'}');
+    if (!Expect(p, L'}')) return false;
+    if (invalidTime) alarm.paused = true;
+    // Legacy data (no "lastFired" key): a stale snoozeUntil never fired back
+    // then (scheduler bug) and would pop at the first start now - drop it.
+    // A Once alarm ignores end conditions (the dialog enforces Never since
+    // 2026-10); normalise old files the same way so a fired Once alarm with a
+    // stale OnDate neither stays silent nor looks like a changed schedule.
+    if (!sawLastFired) alarm.snoozeUntil = 0;
+    if (alarm.kind == AlarmKind::Once) alarm.endKind = AlarmEndKind::Never;
+    return true;
 }
 
 bool Storage::ParseStringArray(const wchar_t*& p, std::vector<std::wstring>& out) {
@@ -731,7 +811,7 @@ bool Storage::ParseNotes(const std::wstring& json, std::vector<std::unique_ptr<N
         } else if (key == L"nextId") {
             int64_t val;
             if (!ParseInt(p, val)) return false;
-            nextId = static_cast<uint64_t>(val);
+            nextId = (val > 0) ? static_cast<uint64_t>(val) : 1;   // never wrap negative
         } else if (key == L"folders") {
             if (!ParseStringArray(p, folders)) return false;
         } else if (key == L"notes") {
@@ -760,35 +840,34 @@ bool Storage::ParseNotes(const std::wstring& json, std::vector<std::unique_ptr<N
 
 std::vector<std::unique_ptr<NoteData>> Storage::LoadNotes(uint64_t& outNextId,
                                                             std::vector<std::wstring>& outFolders,
-                                                            bool& outCorrupt) {
+                                                            bool& outCorrupt,
+                                                            bool& outUnreadable) {
     std::vector<std::unique_ptr<NoteData>> notes;
     outNextId = 1;
     outCorrupt = false;
+    outUnreadable = false;
 
     std::wstring filePath = GetNotesFilePath();
 
-    // Read file as UTF-8
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, filePath.c_str(), L"rb") != 0 || !fp)
-        return notes;
-
-    fseek(fp, 0, SEEK_END);
-    long fileSize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (fileSize <= 0) { fclose(fp); return notes; }
-
-    std::string utf8(static_cast<size_t>(fileSize), '\0');
-    size_t got = fread(&utf8[0], 1, static_cast<size_t>(fileSize), fp);
-    fclose(fp);
-    if (got != static_cast<size_t>(fileSize)) utf8.resize(got);
+    // Read file as UTF-8. Missing file = first start (empty store). Any other
+    // failure is reported via outUnreadable so Application::Initialize can
+    // retry / refuse to run instead of overwriting the notes on the next save.
+    std::string utf8;
+    if (!ReadWholeFile(filePath, utf8, outUnreadable)) return notes;
+    if (utf8.empty()) return notes;   // 0-byte file: nothing to lose, start empty
 
     // Convert UTF-8 to wstring (skip a leading BOM if present)
     size_t bom = Utf8BomOffset(utf8);
     int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str() + bom,
                                        static_cast<int>(utf8.size() - bom),
                                        nullptr, 0);
-    if (wideLen <= 0) return notes;
+    if (wideLen <= 0) {
+        // Not decodable at all: treat like a parse failure (back up + warn)
+        // rather than silently starting with an empty store.
+        CopyFileW(filePath.c_str(), (filePath + L".bak").c_str(), TRUE);
+        outCorrupt = true;
+        return notes;
+    }
 
     std::wstring json(static_cast<size_t>(wideLen), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str() + bom,
@@ -811,21 +890,13 @@ std::vector<std::unique_ptr<NoteData>> Storage::LoadNotes(uint64_t& outNextId,
 // Settings (mixed int + string key-value store)
 // ============================================================================
 
-static std::wstring ReadSettingsFile() {
+// Returns the file content; sets outUnreadable when settings.json exists but
+// cannot be read (see ReadWholeFile) so the cache logic below can refuse to
+// overwrite it with defaults.
+static std::wstring ReadSettingsFile(bool& outUnreadable) {
     std::wstring filePath = GetExeDirectory() + L"\\settings.json";
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, filePath.c_str(), L"rb") != 0 || !fp)
-        return {};
-
-    fseek(fp, 0, SEEK_END);
-    long fileSize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (fileSize <= 0) { fclose(fp); return {}; }
-
-    std::string utf8(static_cast<size_t>(fileSize), '\0');
-    size_t got = fread(&utf8[0], 1, static_cast<size_t>(fileSize), fp);
-    fclose(fp);
-    if (got != static_cast<size_t>(fileSize)) utf8.resize(got);
+    std::string utf8;
+    if (!ReadWholeFile(filePath, utf8, outUnreadable) || utf8.empty()) return {};
 
     size_t bom = Utf8BomOffset(utf8);
     int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str() + bom,
@@ -887,6 +958,10 @@ static void ParseSettingsJson(const std::wstring& json,
 // cache only ever serves data the app itself last wrote or read at startup.
 // ----------------------------------------------------------------------------
 static bool s_settingsCacheValid = false;
+// settings.json exists but could not be read on the last attempt. While set,
+// the cache stays invalid (every read retries the file) and WriteSettingsFile
+// refuses to run, so a transiently locked file is never clobbered with defaults.
+static bool s_settingsUnreadable = false;
 static std::map<std::wstring, int> s_settingsIntCache;
 static std::map<std::wstring, std::wstring> s_settingsStrCache;
 
@@ -894,10 +969,12 @@ static void EnsureSettingsCache() {
     if (s_settingsCacheValid) return;
     s_settingsIntCache.clear();
     s_settingsStrCache.clear();
-    std::wstring json = ReadSettingsFile();
+    bool unreadable = false;
+    std::wstring json = ReadSettingsFile(unreadable);
     if (!json.empty())
         ParseSettingsJson(json, &s_settingsIntCache, &s_settingsStrCache);
-    s_settingsCacheValid = true;  // valid even if the file is missing/empty
+    s_settingsUnreadable = unreadable;
+    s_settingsCacheValid = !unreadable;  // valid even if the file is missing/empty
 }
 
 std::map<std::wstring, int> Storage::LoadSettings() {
@@ -911,6 +988,13 @@ std::map<std::wstring, std::wstring> Storage::LoadSettingsStr() {
 }
 
 static bool WriteSettingsFile(const std::wstring& json) {
+    // Never overwrite a settings.json we could not read (the caller's maps
+    // would only hold defaults). Re-probe first: the lock may be gone by now.
+    if (s_settingsUnreadable) {
+        EnsureSettingsCache();
+        if (s_settingsUnreadable) return false;
+    }
+
     std::wstring filePath = GetExeDirectory() + L"\\settings.json";
     std::wstring tmpPath = filePath + L".tmp";
 
@@ -929,10 +1013,10 @@ static bool WriteSettingsFile(const std::wstring& json) {
         return false;
 
     size_t written = fwrite(utf8.data(), 1, utf8.size(), fp);
-    fflush(fp);
-    FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(fp))));
-    fclose(fp);
-    if (written != utf8.size()) { DeleteFileW(tmpPath.c_str()); return false; }
+    if (!FlushAndClose(fp, written == utf8.size())) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
 
     if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {

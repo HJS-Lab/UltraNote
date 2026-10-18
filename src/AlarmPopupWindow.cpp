@@ -2,6 +2,7 @@
 #include "Application.h"
 #include "Localization.h"
 #include "Resource.h"
+#include "Utils.h"
 #include <mmsystem.h>
 
 bool AlarmPopupWindow::s_classRegistered = false;
@@ -18,10 +19,10 @@ static constexpr int kBtnH    = 28;
 AlarmPopupWindow::AlarmPopupWindow(HINSTANCE hInst, uint64_t noteId,
                                    const std::wstring& title, const std::wstring& text,
                                    bool playSound, const std::wstring& soundFile,
-                                   int snoozeMinutes, int stackIndex)
+                                   int stackIndex)
     : m_hInst(hInst), m_noteId(noteId), m_title(title), m_text(text),
       m_playSound(playSound), m_soundFile(soundFile),
-      m_snoozeMinutes(snoozeMinutes), m_stackIndex(stackIndex) {
+      m_stackIndex(stackIndex) {
 }
 
 AlarmPopupWindow::~AlarmPopupWindow() {
@@ -50,8 +51,14 @@ bool AlarmPopupWindow::EnsureClassRegistered(HINSTANCE hInst) {
 bool AlarmPopupWindow::Create() {
     if (!EnsureClassRegistered(m_hInst)) return false;
 
+    // The popup sits on the primary monitor's work area: lay it out for that
+    // monitor's DPI (the k* constants are 96-dpi values).
+    POINT origin = { 0, 0 };
+    m_dpi = MonitorDpi(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY));
+    auto S = [this](int v) { return DpiScale(v, m_dpi); };
+
     // Adjust client to total size
-    RECT r = { 0, 0, kClientW, kClientH };
+    RECT r = { 0, 0, S(kClientW), S(kClientH) };
     DWORD style   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
     AdjustWindowRectEx(&r, style, FALSE, exStyle);
@@ -61,9 +68,9 @@ bool AlarmPopupWindow::Create() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     int totalW = r.right - r.left;
     int totalH = r.bottom - r.top;
-    int x = wa.right - totalW - 12;
-    int y = wa.bottom - totalH - 12 - m_stackIndex * (totalH + 8);
-    if (y < wa.top + 8) y = wa.top + 8;
+    int x = wa.right - totalW - S(12);
+    int y = wa.bottom - totalH - S(12) - m_stackIndex * (totalH + S(8));
+    if (y < wa.top + S(8)) y = wa.top + S(8);
 
     std::wstring windowTitle = Ls(L"alarm.popup.title");
     m_hwnd = CreateWindowExW(exStyle, kClassName, windowTitle.c_str(),
@@ -107,8 +114,15 @@ LRESULT AlarmPopupWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
             if (cmd == IDC_ALARM_OPEN)    { OnAction(AlarmAction::OpenNote); return 0; }
             if (cmd == IDC_ALARM_SNOOZE)  { OnAction(AlarmAction::Snooze);   return 0; }
             if (cmd == IDC_ALARM_DISMISS) { OnAction(AlarmAction::Dismiss);  return 0; }
+            // Esc via IsDialogMessageW (no button owns IDCANCEL): dismiss.
+            if (cmd == IDCANCEL)          { OnAction(AlarmAction::Dismiss);  return 0; }
             break;
         }
+
+        case DM_GETDEFID:
+            // Not a real dialog: answer IsDialogMessageW so Enter triggers the
+            // default "Dismiss" button instead of an unhandled IDOK.
+            return MAKELRESULT(IDC_ALARM_DISMISS, DC_HASDEFID);
 
         case WM_CLOSE:
             OnAction(AlarmAction::Dismiss);
@@ -132,26 +146,31 @@ LRESULT AlarmPopupWindow::HandleMessage(UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void AlarmPopupWindow::CreateControls() {
-    NONCLIENTMETRICS ncm = { sizeof(ncm) };
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    // All k* layout constants are 96-dpi values; S() maps them to the monitor
+    // DPI determined in Create(). Fonts come pre-scaled for that DPI as well.
+    auto S = [this](int v) { return DpiScale(v, m_dpi); };
+    NONCLIENTMETRICSW ncm;
+    GetNonClientMetricsForDpi(ncm, m_dpi);
     m_hFontText = CreateFontIndirectW(&ncm.lfMessageFont);
-    LOGFONT lf = ncm.lfMessageFont;
+    LOGFONTW lf = ncm.lfMessageFont;
     lf.lfWeight = FW_BOLD;
-    lf.lfHeight = lf.lfHeight - 2;  // slightly larger
+    lf.lfHeight -= S(2);   // slightly larger (negative height = cell height)
     m_hFontTitle = CreateFontIndirectW(&lf);
 
     int y = kMargin;
+    // SS_NOPREFIX on both labels: note titles/text are user data, a '&' in them
+    // must not turn into an underlined mnemonic ("Brot & Milch" -> "Brot _Milch").
     m_hLblTitle = CreateWindowExW(0, L"STATIC", m_title.c_str(),
-                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
-                                  kMargin, y, kClientW - 2 * kMargin, 22,
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX,
+                                  S(kMargin), S(y), S(kClientW - 2 * kMargin), S(22),
                                   m_hwnd, nullptr, m_hInst, nullptr);
     SendMessageW(m_hLblTitle, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFontTitle), TRUE);
 
     y += 26;
     m_hLblText = CreateWindowExW(0, L"STATIC", m_text.c_str(),
-                                 WS_CHILD | WS_VISIBLE | SS_LEFT,   // no SS_ENDELLIPSIS:
+                                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,   // no SS_ENDELLIPSIS:
                                  // that forces a single line and hides the 3-line preview.
-                                 kMargin, y, kClientW - 2 * kMargin, 60,
+                                 S(kMargin), S(y), S(kClientW - 2 * kMargin), S(60),
                                  m_hwnd, nullptr, m_hInst, nullptr);
     SendMessageW(m_hLblText, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFontText), TRUE);
 
@@ -162,21 +181,21 @@ void AlarmPopupWindow::CreateControls() {
 
     m_hBtnOpen = CreateWindowExW(0, L"BUTTON", Ls(L"alarm.popup.open").c_str(),
                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                 kMargin, btnY, kBtnW, kBtnH,
+                                 S(kMargin), S(btnY), S(kBtnW), S(kBtnH),
                                  m_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_OPEN)),
                                  m_hInst, nullptr);
     SendMessageW(m_hBtnOpen, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFontText), TRUE);
 
     m_hBtnSnooze = CreateWindowExW(0, L"BUTTON", Ls(L"alarm.popup.snooze").c_str(),
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                   kMargin + kBtnW + spacing, btnY, kBtnW, kBtnH,
+                                   S(kMargin + kBtnW + spacing), S(btnY), S(kBtnW), S(kBtnH),
                                    m_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_SNOOZE)),
                                    m_hInst, nullptr);
     SendMessageW(m_hBtnSnooze, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFontText), TRUE);
 
     m_hBtnDismiss = CreateWindowExW(0, L"BUTTON", Ls(L"alarm.popup.dismiss").c_str(),
                                     WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                                    kMargin + 2 * (kBtnW + spacing), btnY, kBtnW, kBtnH,
+                                    S(kMargin + 2 * (kBtnW + spacing)), S(btnY), S(kBtnW), S(kBtnH),
                                     m_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ALARM_DISMISS)),
                                     m_hInst, nullptr);
     SendMessageW(m_hBtnDismiss, WM_SETFONT, reinterpret_cast<WPARAM>(m_hFontText), TRUE);
@@ -189,15 +208,14 @@ static AlarmPopupWindow* s_soundOwner = nullptr;
 
 void AlarmPopupWindow::StartSound() {
     if (!m_playSound) return;
-    if (!m_soundFile.empty()) {
-        DWORD attrs = GetFileAttributesW(m_soundFile.c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            PlaySoundW(m_soundFile.c_str(), nullptr,
-                       SND_FILENAME | SND_ASYNC | SND_LOOP | SND_NODEFAULT);
-            m_soundActive = true;
-            s_soundOwner = this;   // we now own the single sound channel
-            return;
-        }
+    // IsWaveFile also covers existence/readability; PlaySoundW itself would
+    // report success for an unplayable (e.g. .mp3) file and stay silent.
+    if (IsWaveFile(m_soundFile) &&
+        PlaySoundW(m_soundFile.c_str(), nullptr,
+                   SND_FILENAME | SND_ASYNC | SND_LOOP | SND_NODEFAULT)) {
+        m_soundActive = true;
+        s_soundOwner = this;   // we now own the single sound channel
+        return;
     }
     // Fallback: one-shot system beep
     MessageBeep(MB_ICONEXCLAMATION);

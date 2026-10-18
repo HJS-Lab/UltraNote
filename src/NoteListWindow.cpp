@@ -13,11 +13,16 @@
 #include <uxtheme.h>
 #include <shlwapi.h>
 #include <ctime>
-#include <algorithm>
 #include <vector>
 #include <unordered_set>
 
 static const wchar_t* NOTELIST_WND_CLASS = L"UltraNoteListWindow";
+
+const int NoteListWindow::kDefaultColWidths[NoteListWindow::COL_COUNT] = {
+    /*TITLE*/ 150, /*TEXT*/ 200, /*FOLDER*/ 100, /*HIDDEN*/ 70, /*ONTOP*/ 70,
+    /*CREATED*/ 130, /*ATTACH*/ 30,
+    /*NEXT_ALARM*/ 130, /*INTERVAL*/ 150, /*ALARM_STATUS*/ 60
+};
 
 // ============================================================================
 // Registration and construction
@@ -182,6 +187,10 @@ void NoteListWindow::Show() {
 
     if (IsIconic(m_hwnd)) {
         ShowWindow(m_hwnd, SW_RESTORE);
+    } else if (IsZoomed(m_hwnd) || m_showMaximized) {
+        // Keep (or restore) the maximized state - SW_SHOWNORMAL would un-maximize.
+        m_showMaximized = false;
+        ShowWindow(m_hwnd, SW_SHOWMAXIMIZED);
     } else {
         // SW_SHOWNORMAL activates the window unconditionally; plain SW_SHOW
         // skips activation when the window is already visible-but-inactive.
@@ -201,7 +210,7 @@ void NoteListWindow::Show() {
     // foreground transition.
     Refresh();
 
-    if (m_previewEnabled) StartPreviewTimer();
+    if (m_previewEnabled && !m_previewPaused) StartPreviewTimer();
 }
 
 void NoteListWindow::Hide() {
@@ -280,25 +289,7 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Folder ListBox selection change
             if (reinterpret_cast<HWND>(lParam) == m_hFolderList && code == LBN_SELCHANGE) {
-                int sel = static_cast<int>(SendMessageW(m_hFolderList, LB_GETCURSEL, 0, 0));
-                if (sel == 0) {
-                    m_folderFilter = FolderFilter::All;
-                    m_selectedFolder.clear();
-                } else if (sel == 1) {
-                    m_folderFilter = FolderFilter::Unfiled;
-                    m_selectedFolder.clear();
-                } else if (sel > 1) {
-                    int len = static_cast<int>(SendMessageW(m_hFolderList, LB_GETTEXTLEN, sel, 0));
-                    if (len > 0) {
-                        std::wstring text(static_cast<size_t>(len), L'\0');
-                        SendMessageW(m_hFolderList, LB_GETTEXT, sel,
-                                     reinterpret_cast<LPARAM>(&text[0]));
-                        m_folderFilter = FolderFilter::Named;
-                        m_selectedFolder = text;
-                    }
-                }
-                PopulateList();
-                ApplyCurrentSort();
+                OnFolderSelectionChanged();
                 return 0;
             }
 
@@ -400,11 +391,12 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                                           MF_BYCOMMAND | (m_previewEnabled ? MF_CHECKED : MF_UNCHECKED));
                     }
                     if (m_previewEnabled) {
-                        StartPreviewTimer();
+                        if (!m_previewPaused) StartPreviewTimer();
                     } else {
                         StopPreviewTimer();
                         HidePreviewNote();
                     }
+                    SaveSettings();   // persist, like the Settings-dialog checkbox does
                     return 0;
                 }
                 case ID_NL_FOLDER_NEW:
@@ -600,12 +592,15 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                                     wchar_t buf[4] = {};
                                     ListView_GetItemText(m_hListView, itemIdx, sub, buf, 4);
 
-                                    if (!m_hSymbolFont) {
+                                    UINT dpi = WindowDpi(m_hwnd);
+                                    if (!m_hSymbolFont || m_symbolFontDpi != dpi) {
+                                        if (m_hSymbolFont) DeleteObject(m_hSymbolFont);
                                         m_hSymbolFont = CreateFontW(
-                                            20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                            DpiScale(20, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                             CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                             DEFAULT_PITCH, L"Segoe UI Symbol");
+                                        m_symbolFontDpi = dpi;
                                     }
                                     HFONT hOldFont = static_cast<HFONT>(
                                         SelectObject(cd->nmcd.hdc, m_hSymbolFont));
@@ -753,6 +748,16 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            // Capture revoked mid-drag (Alt+Tab, a dialog): drop the drag flag so
+            // the splitter doesn't follow the mouse on the next move.
+            if (m_splitterDragging) {
+                m_splitterDragging = false;
+                if (msg == WM_CANCELMODE) ReleaseCapture();
+            }
+            break;
+
         case WM_DRAWITEM: {
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
             if (dis->hwndItem == m_hFolderList) {
@@ -851,9 +856,59 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_CONTEXTMENU: {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            const bool fromKeyboard = (pt.x == -1 && pt.y == -1);   // Shift+F10 / menu key
             if (reinterpret_cast<HWND>(wParam) == m_hFolderList) {
-                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                ShowFolderContextMenu(pt.x, pt.y);
+                // Act on the entry under the cursor, not on LB_GETCURSEL: a
+                // LISTBOX does not select on right-click, so Rename/Delete used
+                // to hit whatever folder was selected BEFORE the click. Select
+                // it first; LBN_SELCHANGE is not sent for LB_SETCURSEL, so apply
+                // the filter change explicitly.
+                bool onItem = false;
+                if (fromKeyboard) {
+                    int sel = static_cast<int>(SendMessageW(m_hFolderList, LB_GETCURSEL, 0, 0));
+                    RECT rc = {};
+                    pt = { 4, 4 };
+                    if (sel >= 0 && SendMessageW(m_hFolderList, LB_GETITEMRECT, sel,
+                                                 reinterpret_cast<LPARAM>(&rc)) != LB_ERR) {
+                        pt = { rc.left + 8, rc.top + (rc.bottom - rc.top) / 2 };
+                        onItem = true;
+                    }
+                    ClientToScreen(m_hFolderList, &pt);
+                } else {
+                    POINT client = pt;
+                    ScreenToClient(m_hFolderList, &client);
+                    LRESULT hit = SendMessageW(m_hFolderList, LB_ITEMFROMPOINT, 0,
+                                               MAKELPARAM(client.x, client.y));
+                    if (HIWORD(hit) == 0) {   // 0 = inside the client area ...
+                        int idx = LOWORD(hit);
+                        // ... but LB_ITEMFROMPOINT reports the NEAREST item for the
+                        // empty area below the last entry: confirm the hit, else a
+                        // right-click into the blank space acted on the last folder.
+                        RECT ir = {};
+                        if (SendMessageW(m_hFolderList, LB_GETITEMRECT, idx,
+                                         reinterpret_cast<LPARAM>(&ir)) != LB_ERR &&
+                            PtInRect(&ir, client)) {
+                            onItem = true;
+                            if (idx != static_cast<int>(SendMessageW(m_hFolderList, LB_GETCURSEL, 0, 0))) {
+                                SendMessageW(m_hFolderList, LB_SETCURSEL, idx, 0);
+                                OnFolderSelectionChanged();
+                            }
+                        }
+                    }
+                }
+                ShowFolderContextMenu(pt.x, pt.y, onItem);
+                return 0;
+            }
+            if (reinterpret_cast<HWND>(wParam) == m_hListView && fromKeyboard) {
+                // Keyboard context menu for the note list (mouse goes via NM_RCLICK)
+                int focus = ListView_GetNextItem(m_hListView, -1, LVNI_FOCUSED);
+                RECT rc = {};
+                pt = { 4, 4 };
+                if (focus >= 0 && ListView_GetItemRect(m_hListView, focus, &rc, LVIR_LABEL))
+                    pt = { rc.left, rc.bottom };
+                ClientToScreen(m_hListView, &pt);
+                ShowNoteContextMenu(pt.x, pt.y);
                 return 0;
             }
             break;
@@ -900,16 +955,15 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (hitIdx != m_previewPendingIdx) {
                     // Cursor moved to a different row
                     m_previewPendingIdx = hitIdx;
-                    m_previewHoverStart = GetTickCount();
+                    m_previewHoverStart = GetTickCount64();
 
                     // If cursor left the list, hide preview
                     if (hitIdx < 0) {
                         HidePreviewNote();
                     }
                 } else if (hitIdx >= 0) {
-                    // Resolve the stable note ID for the hovered row; the row
-                    // index (m_previewNoteIdx) desyncs after any re-sort/Refresh,
-                    // so gate on the note ID instead.
+                    // Resolve the stable note ID for the hovered row (a row index
+                    // would desync after any re-sort/Refresh).
                     LVITEMW item = {};
                     item.mask  = LVIF_PARAM;
                     item.iItem = hitIdx;
@@ -924,11 +978,10 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (noteId != m_previewNoteId &&
                         !Application::Get().IsNoteVisible(noteId)) {
                         // Same row, not yet previewing this note: wait for the delay.
-                        DWORD elapsed = GetTickCount() - m_previewHoverStart;
-                        if (elapsed >= static_cast<DWORD>(m_previewDelay)) {
+                        ULONGLONG elapsed = GetTickCount64() - m_previewHoverStart;
+                        if (elapsed >= static_cast<ULONGLONG>(m_previewDelay)) {
                             HidePreviewNote();
                             ShowPreviewNote(noteId);
-                            m_previewNoteIdx = hitIdx;  // advisory (reset logic)
                         }
                     }
                 }
@@ -941,6 +994,16 @@ LRESULT NoteListWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             break;
+
+        case WM_DPICHANGED: {
+            // PerMonitorV2: take the suggested rect for the new monitor's DPI;
+            // WM_SIZE -> ResizeControls re-lays out the search box etc.
+            auto* rc = reinterpret_cast<const RECT*>(lParam);
+            SetWindowPos(m_hwnd, nullptr, rc->left, rc->top,
+                         rc->right - rc->left, rc->bottom - rc->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
 
         case WM_CLOSE:
             // Hide() persists settings and tears down the preview timer.
@@ -1037,8 +1100,10 @@ void NoteListWindow::CreateSearchEdit() {
     GetWindowRect(m_hToolbar, &tbRect);
     int tbH = tbRect.bottom - tbRect.top;
 
-    int editH = SEARCH_EDIT_HEIGHT;
-    int editW = SEARCH_EDIT_WIDTH;
+    const UINT dpi = WindowDpi(m_hwnd);
+    int editH = DpiScale(SEARCH_EDIT_HEIGHT, dpi);
+    int editW = DpiScale(SEARCH_EDIT_WIDTH, dpi);
+    if (editH > tbH - 2) editH = tbH - 2;   // mixed DPI: the toolbar is sized at system DPI
     int editY = (tbH - editH) / 2;
 
     // Position will be set properly in ResizeControls; create with placeholder coords
@@ -1094,12 +1159,14 @@ LRESULT CALLBACK NoteListWindow::SearchEditSubclassProc(
     auto* self = reinterpret_cast<NoteListWindow*>(refData);
 
     // Width of the NC strip reserved on the right side for the magnifier /
-    // clear-X overlay. 16 px icon area + 2 px padding on each side.
-    static constexpr int kIconStripW = 20;
-    static constexpr int kIconSize   = 16;
+    // clear-X overlay: 16 px icon area + 2 px padding on each side (96-dpi
+    // values, scaled to the window's monitor DPI).
+    const UINT dpi = WindowDpi(hwnd);
+    const int kIconStripW = DpiScale(20, dpi);
+    const int kIconSize   = DpiScale(16, dpi);
 
     // Returns the strip rect in window-local coords (origin at window top-left).
-    auto stripRectLocal = [](HWND h, RECT& out) {
+    auto stripRectLocal = [kIconStripW](HWND h, RECT& out) {
         RECT wr; GetWindowRect(h, &wr);
         const int ww = wr.right  - wr.left;
         const int wh = wr.bottom - wr.top;
@@ -1171,7 +1238,7 @@ LRESULT CALLBACK NoteListWindow::SearchEditSubclassProc(
                 // Draw clear "X" — two diagonal strokes centered in the strip
                 const int cx = strip.left + kIconStripW / 2;
                 const int cy = strip.top  + (strip.bottom - strip.top) / 2;
-                const int r  = 4;
+                const int r  = DpiScale(4, dpi);
                 HPEN hPen  = CreatePen(PS_SOLID, 2, GetSysColor(COLOR_GRAYTEXT));
                 HPEN hOld  = static_cast<HPEN>(SelectObject(hdc, hPen));
                 MoveToEx(hdc, cx - r, cy - r, nullptr);
@@ -1255,10 +1322,20 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
     if (msg == WM_NOTIFY && self) {
         auto* nm = reinterpret_cast<NMHDR*>(lParam);
         if (nm->code == HDN_BEGINDRAG) {
-            auto* hd = reinterpret_cast<NMHEADERW*>(lParam);
-            self->OnHeaderBeginDrag(hd->iItem);
+            self->OnHeaderBeginDrag();
         } else if (nm->code == HDN_ENDDRAG) {
             self->OnHeaderEndDrag();
+        } else if (nm->code == HDN_BEGINTRACKW || nm->code == HDN_BEGINTRACKA ||
+                   nm->code == HDN_DIVIDERDBLCLICKW || nm->code == HDN_DIVIDERDBLCLICKA) {
+            auto* hd = reinterpret_cast<NMHEADERW*>(lParam);
+            // A hidden column (width 0) must not be dragged/auto-sized open via
+            // its divider: m_columnVisible would stay false and the layout
+            // desyncs. TRUE = refuse the track; not forwarding the dblclick
+            // keeps the ListView from auto-sizing it.
+            if (hd->iItem >= 0 && hd->iItem < COL_COUNT && !self->m_columnVisible[hd->iItem])
+                return TRUE;
+            // A divider drag is not a click-to-sort (HeaderSubclassProc).
+            self->m_headerMouseDown = false;
         }
     }
 
@@ -1296,6 +1373,13 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
     // ALT+<key> arrives as WM_SYSKEYDOWN, which the ListView does NOT relay
     // through LVN_KEYDOWN. Without this handler Alt-modified per-note shortcuts
     // (Alt+O, Alt+H) never fire while the list view has focus.
+    if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && self)
+        self->m_swallowNextSysChar = false;   // no SYSCHAR came: don't eat the next mnemonic
+    if (msg == WM_SYSCHAR && self && self->m_swallowNextSysChar) {
+        self->m_swallowNextSysChar = false;
+        return 0;
+    }
+
     if (msg == WM_SYSKEYDOWN && self) {
         auto settings = SettingsDialog::LoadFromStorage();
         WPARAM vk = wParam;
@@ -1313,6 +1397,7 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
         };
 
         if (MatchesShortcut(settings.shortcuts[SC_ALWAYS_ON_TOP], vk)) {
+            self->m_swallowNextSysChar = true;
             // Collect IDs first: a per-note Refresh repopulates the list and
             // clears the selection, so forEachSelected would toggle only the
             // first note. Mutate the batch, then Refresh ONCE (rewrites COL_ONTOP).
@@ -1329,6 +1414,7 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
             return 0;
         }
         if (MatchesShortcut(settings.shortcuts[SC_HIDE], vk)) {
+            self->m_swallowNextSysChar = true;
             bool changed = false;
             forEachSelected([&](int /*idx*/, uint64_t noteId) {
                 NoteData* nd = Application::Get().FindNoteData(noteId);
@@ -1346,6 +1432,7 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
             return 0;
         }
         if (MatchesShortcut(settings.shortcuts[SC_DELETE], vk)) {
+            self->m_swallowNextSysChar = true;
             self->DeleteSelectedNotes();
             return 0;
         }
@@ -1357,12 +1444,11 @@ LRESULT CALLBACK NoteListWindow::ListViewSubclassProc(
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-void NoteListWindow::OnHeaderBeginDrag(int sourceIdx) {
+void NoteListWindow::OnHeaderBeginDrag() {
     // A column drag started: clear the click-tracking flag so the WM_LBUTTONUP
     // that ends the drop is not mistaken for a click-to-sort in HeaderSubclassProc.
     m_headerMouseDown  = false;
     m_headerDragging   = true;
-    m_headerDragSource = sourceIdx;
     if (!m_headerDragOverlay)
         m_headerDragOverlay = std::make_unique<HeaderDragOverlay>(m_hInst);
     SetTimer(m_hwnd, IDT_HEADER_DRAG, HEADER_DRAG_POLL_MS, nullptr);
@@ -1371,7 +1457,6 @@ void NoteListWindow::OnHeaderBeginDrag(int sourceIdx) {
 
 void NoteListWindow::OnHeaderEndDrag() {
     m_headerDragging   = false;
-    m_headerDragSource = -1;
     KillTimer(m_hwnd, IDT_HEADER_DRAG);
     if (m_headerDragOverlay) m_headerDragOverlay->Hide();
 }
@@ -1471,6 +1556,28 @@ void NoteListWindow::CreateFolderList() {
     );
 
     PopulateFolderList();
+}
+
+void NoteListWindow::OnFolderSelectionChanged() {
+    int sel = static_cast<int>(SendMessageW(m_hFolderList, LB_GETCURSEL, 0, 0));
+    if (sel == 0) {
+        m_folderFilter = FolderFilter::All;
+        m_selectedFolder.clear();
+    } else if (sel == 1) {
+        m_folderFilter = FolderFilter::Unfiled;
+        m_selectedFolder.clear();
+    } else if (sel > 1) {
+        int len = static_cast<int>(SendMessageW(m_hFolderList, LB_GETTEXTLEN, sel, 0));
+        if (len > 0) {
+            std::wstring text(static_cast<size_t>(len), L'\0');
+            SendMessageW(m_hFolderList, LB_GETTEXT, sel,
+                         reinterpret_cast<LPARAM>(&text[0]));
+            m_folderFilter = FolderFilter::Named;
+            m_selectedFolder = text;
+        }
+    }
+    PopulateList();
+    ApplyCurrentSort();
 }
 
 void NoteListWindow::PopulateFolderList() {
@@ -1584,48 +1691,48 @@ void NoteListWindow::SetupColumns() {
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
     col.fmt = LVCFMT_LEFT;
 
-    col.cx = 150;
+    col.cx = kDefaultColWidths[COL_TITLE];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_title").c_str());
     ListView_InsertColumn(m_hListView, COL_TITLE, &col);
 
-    col.cx = 200;
+    col.cx = kDefaultColWidths[COL_TEXT];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_text").c_str());
     ListView_InsertColumn(m_hListView, COL_TEXT, &col);
 
-    col.cx = 100;
+    col.cx = kDefaultColWidths[COL_FOLDER];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_folder").c_str());
     ListView_InsertColumn(m_hListView, COL_FOLDER, &col);
 
-    col.cx = 70;
+    col.cx = kDefaultColWidths[COL_HIDDEN];
     col.fmt = LVCFMT_CENTER;
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_hidden").c_str());
     ListView_InsertColumn(m_hListView, COL_HIDDEN, &col);
 
-    col.cx = 70;
+    col.cx = kDefaultColWidths[COL_ONTOP];
     col.fmt = LVCFMT_CENTER;
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_ontop").c_str());
     ListView_InsertColumn(m_hListView, COL_ONTOP, &col);
 
     col.fmt = LVCFMT_LEFT;
-    col.cx = 130;
+    col.cx = kDefaultColWidths[COL_CREATED];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_created").c_str());
     ListView_InsertColumn(m_hListView, COL_CREATED, &col);
 
-    col.cx = 30;
+    col.cx = kDefaultColWidths[COL_ATTACH];
     col.fmt = LVCFMT_CENTER;
     col.pszText = const_cast<LPWSTR>(L"");
     ListView_InsertColumn(m_hListView, COL_ATTACH, &col);
 
     col.fmt = LVCFMT_LEFT;
-    col.cx = 130;
+    col.cx = kDefaultColWidths[COL_NEXT_ALARM];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_next_alarm").c_str());
     ListView_InsertColumn(m_hListView, COL_NEXT_ALARM, &col);
 
-    col.cx = 150;
+    col.cx = kDefaultColWidths[COL_INTERVAL];
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_interval").c_str());
     ListView_InsertColumn(m_hListView, COL_INTERVAL, &col);
 
-    col.cx = 60;
+    col.cx = kDefaultColWidths[COL_ALARM_STATUS];
     col.fmt = LVCFMT_CENTER;
     col.pszText = const_cast<LPWSTR>(Ls(L"notelist.col_alarm_status").c_str());
     ListView_InsertColumn(m_hListView, COL_ALARM_STATUS, &col);
@@ -1644,6 +1751,9 @@ void NoteListWindow::SetupColumns() {
 }
 
 void NoteListWindow::PopulateList(const wchar_t* dateFmt) {
+    // Batch the rebuild: without WM_SETREDRAW the ListView repaints per
+    // inserted item/subitem (hundreds of paints per keystroke in the search box).
+    SendMessageW(m_hListView, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(m_hListView);
 
     // Date format (0 = YYYY-MM-DD HH:MM, 1 = DD.MM.YYYY HH:MM). Refresh passes it
@@ -1691,10 +1801,9 @@ void NoteListWindow::PopulateList(const wchar_t* dateFmt) {
             titleDisplay = Ls(L"note.untitled");
         }
 
-        // Text: first line
-        std::wstring textDisplay = note.text;
-        auto nl = textDisplay.find(L'\n');
-        if (nl != std::wstring::npos) textDisplay = textDisplay.substr(0, nl);
+        // Text: first line (copy only the prefix, not the whole note text)
+        std::wstring textDisplay = note.text.substr(0, note.text.find(L'\n'));
+        if (!textDisplay.empty() && textDisplay.back() == L'\r') textDisplay.pop_back();
         if (textDisplay.empty()) textDisplay = Ls(L"note.empty");
 
         // Folder display
@@ -1780,6 +1889,8 @@ void NoteListWindow::PopulateList(const wchar_t* dateFmt) {
         ++insertIdx;
     }
 
+    SendMessageW(m_hListView, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(m_hListView, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
     UpdateStatusBar();
 }
 
@@ -1790,10 +1901,55 @@ void NoteListWindow::Refresh() {
     m_zebraStriping = settings.zebraStriping;
     m_previewDelay = settings.previewDelay;   // keep the timer's delay fresh
 
+    // Preserve selection, focus and scroll position across the repopulate:
+    // DeleteAllItems wipes them, which broke multi-select toggles (the second
+    // Alt+O found nothing selected) and jumped to the top on every change.
+    std::unordered_set<uint64_t> selIds;
+    uint64_t focusId = 0;
+    {
+        int idx = -1;
+        while ((idx = ListView_GetNextItem(m_hListView, idx, LVNI_SELECTED)) >= 0) {
+            LVITEMW it = {}; it.mask = LVIF_PARAM; it.iItem = idx;
+            if (ListView_GetItem(m_hListView, &it)) selIds.insert(static_cast<uint64_t>(it.lParam));
+        }
+        int fIdx = ListView_GetNextItem(m_hListView, -1, LVNI_FOCUSED);
+        if (fIdx >= 0) {
+            LVITEMW it = {}; it.mask = LVIF_PARAM; it.iItem = fIdx;
+            if (ListView_GetItem(m_hListView, &it)) focusId = static_cast<uint64_t>(it.lParam);
+        }
+    }
+    int topIndex = ListView_GetTopIndex(m_hListView);
+
     PopulateFolderList();
     // Pass the date format we already loaded so PopulateList doesn't re-read it.
     PopulateList(settings.dateFormat == 1 ? L"%d.%m.%Y %H:%M" : L"%Y-%m-%d %H:%M");
     ApplyCurrentSort();
+
+    if (!selIds.empty() || focusId != 0 || topIndex > 0) {
+        SendMessageW(m_hListView, WM_SETREDRAW, FALSE, 0);
+        int count = ListView_GetItemCount(m_hListView);
+        for (int i = 0; i < count; ++i) {
+            LVITEMW it = {}; it.mask = LVIF_PARAM; it.iItem = i;
+            if (!ListView_GetItem(m_hListView, &it)) continue;
+            uint64_t id = static_cast<uint64_t>(it.lParam);
+            UINT state = 0;
+            if (selIds.count(id)) state |= LVIS_SELECTED;
+            if (id == focusId)    state |= LVIS_FOCUSED;
+            if (state) ListView_SetItemState(m_hListView, i, state, state);
+        }
+        if (topIndex > 0 && count > 0) {
+            // Scroll back: make the old last-visible row visible first, then
+            // the old top row, so the viewport lands on the same page.
+            int perPage = ListView_GetCountPerPage(m_hListView);
+            int top  = topIndex < count ? topIndex : count - 1;
+            int last = top + (perPage > 0 ? perPage - 1 : 0);
+            if (last >= count) last = count - 1;
+            ListView_EnsureVisible(m_hListView, last, FALSE);
+            ListView_EnsureVisible(m_hListView, top, FALSE);
+        }
+        SendMessageW(m_hListView, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(m_hListView, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
 }
 
 void NoteListWindow::ResizeControls() {
@@ -1809,8 +1965,10 @@ void NoteListWindow::ResizeControls() {
 
         // Position search edit at right side of toolbar
         if (m_hSearchEdit) {
-            int editW = 160;
-            int editH = 22;
+            const UINT dpi = WindowDpi(m_hwnd);
+            int editW = DpiScale(SEARCH_EDIT_WIDTH, dpi);
+            int editH = DpiScale(SEARCH_EDIT_HEIGHT, dpi);
+            if (editH > tbHeight - 2) editH = tbHeight - 2;   // see CreateSearchEdit
             int editY = (tbHeight - editH) / 2;
             int editX = rc.right - editW - 4;
             if (editX < 0) editX = 0;
@@ -1878,6 +2036,10 @@ void NoteListWindow::LoadSettings() {
             SetWindowPos(m_hwnd, nullptr, x, y, w, h, flags);
         }
     }
+    // Maximized state is applied on the first Show() (the window is created
+    // hidden; SW_SHOWMAXIMIZED here would display it).
+    auto itMax = settings.find(L"notelist.maximized");
+    m_showMaximized = (itMax != settings.end() && itMax->second != 0);
 
     // Folder list width
     auto itFW = settings.find(L"notelist.folder_width");
@@ -1956,12 +2118,18 @@ void NoteListWindow::SaveSettings() {
 
     auto settings = Storage::LoadSettings();
 
-    RECT wr;
-    GetWindowRect(m_hwnd, &wr);
-    settings[L"notelist.x"]      = wr.left;
-    settings[L"notelist.y"]      = wr.top;
-    settings[L"notelist.width"]  = wr.right - wr.left;
-    settings[L"notelist.height"] = wr.bottom - wr.top;
+    // While maximized, GetWindowRect reports the maximized frame (-8/-8 and
+    // screen-sized); keep the last saved normal geometry and store the flag.
+    bool maximized = IsZoomed(m_hwnd) != FALSE;
+    if (!maximized) {
+        RECT wr;
+        GetWindowRect(m_hwnd, &wr);
+        settings[L"notelist.x"]      = wr.left;
+        settings[L"notelist.y"]      = wr.top;
+        settings[L"notelist.width"]  = wr.right - wr.left;
+        settings[L"notelist.height"] = wr.bottom - wr.top;
+    }
+    settings[L"notelist.maximized"] = maximized ? 1 : 0;
 
     settings[L"notelist.folder_width"] = m_folderListWidth;
     settings[L"notelist.preview"] = m_previewEnabled ? 1 : 0;
@@ -2018,12 +2186,6 @@ void NoteListWindow::SetColumnVisible(int col, bool visible) {
     if (col < 0 || col >= COL_COUNT || !m_hListView) return;
     if (m_columnVisible[col] == visible) return;
 
-    static const int defaultWidths[COL_COUNT] = {
-        /*TITLE*/ 150, /*TEXT*/ 200, /*FOLDER*/ 100, /*HIDDEN*/ 70, /*ONTOP*/ 70,
-        /*CREATED*/ 130, /*ATTACH*/ 30,
-        /*NEXT_ALARM*/ 130, /*INTERVAL*/ 150, /*ALARM_STATUS*/ 60
-    };
-
     if (!visible) {
         // Hide: remember current width, set width to 0
         int cur = ListView_GetColumnWidth(m_hListView, col);
@@ -2032,7 +2194,7 @@ void NoteListWindow::SetColumnVisible(int col, bool visible) {
     } else {
         // Show: restore saved width (or default if none remembered)
         int w = m_columnSavedWidths[col];
-        if (w <= 20) w = defaultWidths[col];
+        if (w <= 20) w = kDefaultColWidths[col];
         ListView_SetColumnWidth(m_hListView, col, w);
     }
     m_columnVisible[col] = visible;
@@ -2125,14 +2287,14 @@ int CALLBACK NoteListWindow::CompareFunc(LPARAM lp1, LPARAM lp2, LPARAM sortPara
             // Compare by title, fallback to text
             const std::wstring& t1 = n1->title.empty() ? n1->text : n1->title;
             const std::wstring& t2 = n2->title.empty() ? n2->text : n2->title;
-            result = _wcsicmp(t1.c_str(), t2.c_str());
+            result = CompareLocaleNoCase(t1, t2);
             break;
         }
         case COL_TEXT:
-            result = _wcsicmp(n1->text.c_str(), n2->text.c_str());
+            result = CompareLocaleNoCase(n1->text, n2->text);
             break;
         case COL_FOLDER:
-            result = _wcsicmp(n1->folder.c_str(), n2->folder.c_str());
+            result = CompareLocaleNoCase(n1->folder, n2->folder);
             break;
         case COL_CREATED: {
             int64_t t1 = n1->modifiedAt > 0 ? n1->modifiedAt : n1->createdAt;
@@ -2146,6 +2308,11 @@ int CALLBACK NoteListWindow::CompareFunc(LPARAM lp1, LPARAM lp2, LPARAM sortPara
             break;
         case COL_ONTOP:
             result = static_cast<int>(n1->layout.alwaysOnTop) - static_cast<int>(n2->layout.alwaysOnTop);
+            break;
+        case COL_ATTACH:
+            // Was missing: a header click on the attachment column only toggled
+            // the arrow. Notes with attachments sort after those without.
+            result = static_cast<int>(!n1->attachments.empty()) - static_cast<int>(!n2->attachments.empty());
             break;
         case COL_NEXT_ALARM: {
             // Notes without a future alarm sort to the end regardless of direction.
@@ -2174,7 +2341,7 @@ int CALLBACK NoteListWindow::CompareFunc(LPARAM lp1, LPARAM lp2, LPARAM sortPara
             if (i1.empty() && i2.empty()) return 0;
             if (i1.empty()) return 1;
             if (i2.empty()) return -1;
-            result = _wcsicmp(i1.c_str(), i2.c_str());
+            result = CompareLocaleNoCase(i1, i2);
             break;
         }
         case COL_ALARM_STATUS: {
@@ -2211,7 +2378,6 @@ void NoteListWindow::EditSelectedNote() {
         RestorePreviewPosition();
         m_previewWasHidden = false;
         m_previewNoteId = 0;
-        m_previewNoteIdx = -1;
     }
 
     // Opening a note from the list shows it in display mode — let the user
@@ -2300,27 +2466,6 @@ void NoteListWindow::RenameSelectedNote() {
     }
 }
 
-void NoteListWindow::ShowSetFolderMenu() {
-    HMENU hPopup = CreatePopupMenu();
-    if (!hPopup) return;
-
-    // "(No Folder)" as first entry
-    AppendMenuW(hPopup, MF_STRING, ID_NL_FOLDER_BASE, Ls(L"note.no_folder").c_str());
-    AppendMenuW(hPopup, MF_SEPARATOR, 0, nullptr);
-
-    auto& folders = Application::Get().GetFolders();
-    for (size_t i = 0; i < folders.size() && i + 1 < (ID_NL_FOLDER_MAX - ID_NL_FOLDER_BASE); ++i) {
-        AppendMenuW(hPopup, MF_STRING,
-                    ID_NL_FOLDER_BASE + static_cast<UINT>(i + 1),
-                    folders[i].c_str());
-    }
-
-    POINT pt;
-    GetCursorPos(&pt);
-    TrackPopupMenu(hPopup, TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hwnd, nullptr);
-    DestroyMenu(hPopup);
-}
-
 // ============================================================================
 // Export with empty-selection fallback ("All" / "Cancel" task dialog)
 // ============================================================================
@@ -2340,7 +2485,6 @@ void NoteListWindow::HandleExport() {
     if (ids.empty()) {
         // Empty selection — ask whether to export everything currently visible
         // (all items in the ListView, i.e. respecting folder/search filters).
-        std::wstring title       = Ls(L"export.empty_selection_title");
         std::wstring instruction = Ls(L"export.empty_selection_title");
         std::wstring content     = Ls(L"export.empty_selection_text");
         std::wstring btnAll      = Ls(L"export.btn_all");
@@ -2431,8 +2575,9 @@ void NoteListWindow::ToggleNoteHidden(uint64_t noteId) {
     if (!note) return;
 
     if (note->isHidden) {
-        // Show the note (BringNoteToFront already triggers RefreshNoteList)
-        app.BringNoteToFront(noteId);
+        // Show the note in DISPLAY mode (list-originated opens never auto-edit;
+        // BringNoteToFront already triggers RefreshNoteList)
+        app.BringNoteToFront(noteId, false);
     } else {
         // Hide the note
         note->isHidden = true;
@@ -2453,7 +2598,9 @@ void NoteListWindow::ApplyAlwaysOnTopToggle(uint64_t noteId) {
     if (wnd) {
         SetWindowPos(wnd->GetHwnd(),
                      note->layout.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
-                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // SWP_NOACTIVATE: the toggle comes from the list; activating the note
+        // here moved the keyboard focus, so the next Del hit the WRONG note.
     }
 }
 
@@ -2515,7 +2662,7 @@ void NoteListWindow::ShowNoteContextMenu(int screenX, int screenY) {
         if (haveCurrent && currentFolder == folders[i]) flags |= MF_CHECKED;
         AppendMenuW(hFolderSub, flags,
                     ID_NL_FOLDER_BASE + static_cast<UINT>(i + 1),
-                    folders[i].c_str());
+                    EscapeMenuText(folders[i]).c_str());   // '&' in folder names
     }
     {
         MENUITEMINFOW mii = {};
@@ -2545,14 +2692,14 @@ void NoteListWindow::ShowNoteContextMenu(int screenX, int screenY) {
     DestroyMenu(hPopup);
 }
 
-void NoteListWindow::ShowFolderContextMenu(int screenX, int screenY) {
+void NoteListWindow::ShowFolderContextMenu(int screenX, int screenY, bool onItem) {
     HMENU hPopup = CreatePopupMenu();
     if (!hPopup) return;
 
     int sel = static_cast<int>(SendMessageW(m_hFolderList, LB_GETCURSEL, 0, 0));
     // Index 0 = "All Notes", index 1 = "Unfiled" — both fixed entries.
-    // Rename/delete only apply to user folders (index >= 2).
-    bool isUserFolder = (sel > 1);
+    // Rename/delete only apply to user folders (index >= 2) that were hit.
+    bool isUserFolder = onItem && (sel > 1);
 
     auto& app = Application::Get();
 
@@ -2574,21 +2721,42 @@ void NoteListWindow::ShowFolderContextMenu(int screenX, int screenY) {
 // Folder dialogs
 // ============================================================================
 
+// True if a folder with exactly this name exists. AddFolder/RenameFolder keep
+// names unique by exact match; the user is told instead of a silent no-op (new)
+// or a duplicate entry in notes.json (rename).
+static bool FolderExists(const std::wstring& name) {
+    for (const auto& f : Application::Get().GetFolders())
+        if (f == name) return true;
+    return false;
+}
+
 void NoteListWindow::NewFolderDialog() {
     std::wstring name;
     if (InputDialog(m_hwnd, Ls(L"folder.enter_name"), Ls(L"folder.new"), name)) {
-        if (!name.empty()) {
-            Application::Get().AddFolder(name);
+        if (name.empty()) return;
+        if (FolderExists(name)) {
+            MessageBoxW(m_hwnd, FormatStr(Ls(L"folder.exists"), name).c_str(),
+                        L"UltraNote", MB_OK | MB_ICONINFORMATION);
+            return;
         }
+        Application::Get().AddFolder(name);
     }
 }
 
 void NoteListWindow::RenameFolderDialog(const std::wstring& oldName) {
     std::wstring name = oldName;
     if (InputDialog(m_hwnd, Ls(L"folder.enter_name"), Ls(L"folder.rename"), name)) {
-        if (!name.empty() && name != oldName) {
-            Application::Get().RenameFolder(oldName, name);
+        if (name.empty() || name == oldName) return;
+        if (FolderExists(name)) {
+            MessageBoxW(m_hwnd, FormatStr(Ls(L"folder.exists"), name).c_str(),
+                        L"UltraNote", MB_OK | MB_ICONINFORMATION);
+            return;
         }
+        // Keep the filter on the renamed folder: PopulateFolderList restores the
+        // selection by name and would otherwise fall back to "All Notes".
+        if (m_folderFilter == FolderFilter::Named && m_selectedFolder == oldName)
+            m_selectedFolder = name;
+        Application::Get().RenameFolder(oldName, name);
     }
 }
 
@@ -2617,7 +2785,10 @@ void NoteListWindow::SetPreviewEnabled(bool enabled) {
                           MF_BYCOMMAND | (m_previewEnabled ? MF_CHECKED : MF_UNCHECKED));
     }
     if (m_previewEnabled) {
-        StartPreviewTimer();
+        // Only poll while the list is actually open (and not paused by the
+        // settings dialog): every Settings-OK used to start the 100 ms timer on
+        // the hidden window and keep the idle tray process waking up.
+        if (IsVisible() && !m_previewPaused) StartPreviewTimer();
     } else {
         StopPreviewTimer();
         HidePreviewNote();
@@ -2625,6 +2796,7 @@ void NoteListWindow::SetPreviewEnabled(bool enabled) {
 }
 
 void NoteListWindow::SetPreviewPaused(bool paused) {
+    m_previewPaused = paused;
     if (paused) {
         StopPreviewTimer();
         HidePreviewNote();
@@ -2648,7 +2820,6 @@ void NoteListWindow::StopPreviewTimer() {
         m_previewTimerActive = false;
     }
     m_previewPendingIdx = -1;
-    m_previewNoteIdx = -1;
 }
 
 void NoteListWindow::ShowPreviewNote(uint64_t noteId) {
@@ -2719,14 +2890,11 @@ void NoteListWindow::HidePreviewNote() {
         }
     }
     m_previewNoteId = 0;
-    m_previewNoteIdx = -1;
     m_previewWasHidden = false;
 
-    // Restore focus and redraw only if a preview was actually showing. The
-    // hover timer calls this on every row change; an unconditional SetFocus
-    // would yank focus away from the search field on each wake-up.
+    // Redraw the row highlight. No SetFocus here: the preview no longer takes
+    // activation (SW_SHOWNOACTIVATE), so focus never left the list/search box.
     if (hadPreview && m_hListView) {
-        SetFocus(m_hListView);
         InvalidateRect(m_hListView, nullptr, FALSE);
     }
 }
@@ -2742,39 +2910,43 @@ INT_PTR CALLBACK NoteListWindow::InputDlgProc(HWND hwnd, UINT msg, WPARAM wParam
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
             SetWindowTextW(hwnd, data->title.c_str());
 
-            // Compact layout: 250px wide content area
-            int contentW = 250;
-            int margin = 10;
-            int btnW = 75;
-            int btnH = 24;
-            int btnGap = 8;
+            // Compact layout: 250px wide content area (96-dpi values, scaled to
+            // the dialog's monitor DPI - the pixel-positioned controls did not
+            // grow with the DLU-sized frame before)
+            const UINT dpi = WindowDpi(hwnd);
+            auto S = [dpi](int v) { return DpiScale(v, dpi); };
+            int contentW = S(250);
+            int margin = S(10);
+            int btnW = S(75);
+            int btnH = S(24);
+            int btnGap = S(8);
 
             // Create static label
             CreateWindowExW(0, L"STATIC", data->prompt.c_str(),
                             WS_CHILD | WS_VISIBLE,
-                            margin, 8, contentW, 16,
+                            margin, S(8), contentW, S(16),
                             hwnd, nullptr, nullptr, nullptr);
 
             // Create edit control
             HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", data->value.c_str(),
-                                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                          margin, 28, contentW, 22,
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                          margin, S(28), contentW, S(22),
                                           hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100)),
                                           nullptr, nullptr);
 
             // OK / Cancel buttons (right-aligned)
-            int btnY = 58;
+            int btnY = S(58);
             int cancelX = margin + contentW - btnW;
             int okX = cancelX - btnGap - btnW;
 
             CreateWindowExW(0, L"BUTTON", Ls(L"settings.ok").c_str(),
-                            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                             okX, btnY, btnW, btnH,
                             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)),
                             nullptr, nullptr);
 
             CreateWindowExW(0, L"BUTTON", Ls(L"settings.cancel").c_str(),
-                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                             cancelX, btnY, btnW, btnH,
                             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)),
                             nullptr, nullptr);
@@ -2782,8 +2954,8 @@ INT_PTR CALLBACK NoteListWindow::InputDlgProc(HWND hwnd, UINT msg, WPARAM wParam
             // Use the modern system message font (Segoe UI 9pt on Win 10/11)
             // instead of DEFAULT_GUI_FONT (MS Sans Serif 8pt) so labels,
             // edit and buttons match the visual weight of the rest of the OS.
-            NONCLIENTMETRICSW ncm = { sizeof(ncm) };
-            SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+            NONCLIENTMETRICSW ncm;
+            GetNonClientMetricsForDpi(ncm, dpi);
             HFONT hFont = CreateFontIndirectW(&ncm.lfMessageFont);
             if (!hFont) hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
             SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(hFont));
